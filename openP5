@@ -1,0 +1,788 @@
+import os
+import math
+import json
+import random
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_linear_schedule_with_warmup,
+)
+
+# Optional PEFT LoRA
+try:
+    from peft import LoraConfig, get_peft_model
+    PEFT_AVAILABLE = True
+except Exception:
+    PEFT_AVAILABLE = False
+
+# Optional spectral clustering (CID). If sklearn is missing, we fall back to k-means on PCA.
+try:
+    from sklearn.cluster import SpectralClustering, KMeans
+    from sklearn.decomposition import TruncatedSVD
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+import re
+
+DATASET_NAME = "ML10M100K"
+
+# ------------------------------
+# Utils
+# ------------------------------
+def is_distributed_env():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return world_size > 1
+
+def init_distributed():
+    if is_distributed_env():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        return True, rank, world_size, local_rank
+    else:
+        return False, 0, 1, 0
+
+def cleanup_distributed():
+    if is_distributed_env() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+def set_seed(seed: int = 42, rank: int = 0):
+    seed = seed + rank  # make each rank different but reproducible
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+    return p
+
+# ==============================
+# 新的数据输入：读取 original/test JSONL + item_ids.json
+# ==============================
+_TOKEN_RE = re.compile(r"<item_(\d+)>")
+
+def _tok_to_mid(tok: str) -> int:
+    """将 '<item_123>' → 123；若已是纯数字字符串也兼容。"""
+    tok = tok.strip()
+    m = _TOKEN_RE.fullmatch(tok)
+    if m:
+        return int(m.group(1))
+    tok = tok.lstrip("<").rstrip(">")
+    if tok.startswith("item_"):
+        tok = tok[len("item_"):]
+    return int(tok)
+
+def _load_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+def _build_user_pairs_from_segment(rows: List[dict]) -> Dict[int, List[Tuple[int, int]]]:
+    """
+    从 original/test JSONL 的样本构建 uid -> [(mid, ts)]（按 ts 升序）。
+    仅使用每条样本的 target+timestamp；prompt 不参与时序构建。
+    """
+    per_user: Dict[int, List[Tuple[int, int]]] = {}
+    for r in rows:
+        uid = int(r["user_id"])
+        ts = int(r["timestamp"])
+        mid = _tok_to_mid(r["target"])
+        per_user.setdefault(uid, []).append((mid, ts))
+    # 升序+去重
+    for u in per_user:
+        seq = sorted(per_user[u], key=lambda x: x[1])
+        dedup, seen = [], set()
+        for mid, ts in seq:
+            if (mid, ts) in seen:
+                continue
+            seen.add((mid, ts))
+            dedup.append((mid, ts))
+        per_user[u] = dedup
+    return per_user
+
+def _build_user_pairs_from_stream(rows: List[dict]) -> Dict[int, List[Tuple[int, int]]]:
+    """
+    输入（每行一位用户的完整序列）:
+      {"user_id": ..., "items": "<item_a> <item_b> ...", "timestamps": "t_a t_b ..."}  # timestamps 可缺省
+    输出：uid -> [(mid, ts)]（按 ts 升序），若无时间戳则用位置索引 0..L-1 作为伪时间。
+    """
+    per_user: Dict[int, List[Tuple[int, int]]] = {}
+    for r in rows:
+        if "user_id" not in r:
+            continue
+        uid = int(r["user_id"])
+        items_str = (r.get("items") or "").strip()
+        if not items_str:
+            continue
+        toks = items_str.split()
+
+        ts_list = None
+        ts_str = (r.get("timestamps") or "").strip()
+        if ts_str:
+            try:
+                ts_list = [int(x) for x in ts_str.split()]
+                if len(ts_list) != len(toks):
+                    ts_list = None
+            except Exception:
+                ts_list = None
+
+        for i, t in enumerate(toks):
+            try:
+                mid = _tok_to_mid(t)
+            except Exception:
+                continue
+            ts = ts_list[i] if ts_list is not None else i  # 递增伪时间
+            per_user.setdefault(uid, []).append((mid, ts))
+
+    # 升序 + (mid, ts) 去重
+    for u in per_user:
+        seq = sorted(per_user[u], key=lambda x: x[1])
+        dedup, seen = [], set()
+        for mid, ts in seq:
+            if (mid, ts) in seen:
+                continue
+            seen.add((mid, ts))
+            dedup.append((mid, ts))
+        per_user[u] = dedup
+    return per_user
+
+def _read_vocab(item_ids_path: str) -> List[int]:
+    with open(item_ids_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict) and "item_ids" in obj:
+        item_ids = obj["item_ids"]
+    else:
+        item_ids = obj
+    return [int(x) for x in item_ids]
+
+def _build_base_map(item_ids: List[int],
+                    train_pairs: Dict[int, List[Tuple[int, int]]],
+                    method: str = "sequential",
+                    seed: int = 42) -> Dict[int, int]:
+    """
+    物品映射：raw mid -> 连续 idx [0..N-1]
+    - sequential：按“训练集首次出现时间”升序；仅在 test 出现的物品排在最后（按 mid 升序）。
+    - random：对 item_ids 随机打乱（确定性种子）。
+    """
+    if method == "random":
+        items = list(item_ids)
+        rng = random.Random(seed)
+        rng.shuffle(items)
+        return {m: i for i, m in enumerate(items)}
+
+    # sequential（默认）
+    first_ts: Dict[int, int] = {}
+    for pairs in train_pairs.values():
+        for m, ts in pairs:
+            if m not in first_ts:
+                first_ts[m] = ts
+    def sort_key(m):
+        if m in first_ts:
+            return (0, first_ts[m], m)
+        else:
+            return (1, 1 << 62, m)  # 仅出现在 test 的物品靠后
+    items = sorted(item_ids, key=sort_key)
+    return {m: i for i, m in enumerate(items)}
+
+def _pairs_to_index_sequences(pairs: Dict[int, List[Tuple[int, int]]],
+                              mid2idx: Dict[int, int]) -> Dict[int, List[int]]:
+    u2s: Dict[int, List[int]] = {}
+    for u, lst in pairs.items():
+        idx_seq = []
+        for mid, _ts in lst:
+            if mid in mid2idx:
+                idx_seq.append(mid2idx[mid])
+        u2s[u] = idx_seq
+    return u2s
+
+def load_preprocessed_splits(data_dir: str,
+                             item_indexing: str = "sequential",
+                             seed: int = 42,
+                             min_user_len: int = 5):
+    path_orig = os.path.join(data_dir, "original.jsonl")  # 注意是 *_stream.jsonl
+    path_test = os.path.join(data_dir, "test.jsonl")
+    path_vocab = os.path.join(data_dir, "item_ids.json")
+    if not os.path.exists(path_orig): raise FileNotFoundError(path_orig)
+    if not os.path.exists(path_test): raise FileNotFoundError(path_test)
+    if not os.path.exists(path_vocab): raise FileNotFoundError(path_vocab)
+
+    rows_orig = _load_jsonl(path_orig)
+    rows_test = _load_jsonl(path_test)
+
+    # ✅ 训练：整段序列 → pairs
+    train_pairs = _build_user_pairs_from_stream(rows_orig)   # uid -> [(mid, ts)]
+    # ✅ 测试：仍然用 sample target/timestamp → pairs（与原评测保持一致）
+    test_pairs  = _build_user_pairs_from_segment(rows_test)  # uid -> [(mid, ts)]
+
+    item_ids = _read_vocab(path_vocab)
+
+    # base mapping：按“训练集首次出现时间”或随机（不泄漏测试）
+    base_map = _build_base_map(item_ids, train_pairs,
+                               method=("random" if item_indexing == "random" else "sequential"),
+                               seed=seed)
+
+    # 映射为索引序列
+    train_seq = _pairs_to_index_sequences(train_pairs, base_map)
+    test_seq  = _pairs_to_index_sequences(test_pairs,  base_map)
+
+    # 过滤过短；验证集沿用训练序列（与原逻辑一致）
+    def _filter(u2s: Dict[int, List[int]], k: int):
+        return {u: s for u, s in u2s.items() if len(s) >= k}
+    train_seq = _filter(train_seq, min_user_len)
+    test_seq  = _filter(test_seq,  min_user_len)
+    val_seq   = {u: s[:] for u, s in train_seq.items() if len(s) >= 2}
+
+    n_items = len(item_ids)
+    return train_seq, val_seq, test_seq, n_items, base_map
+
+
+# ------------------------------
+# Item tokenization (OpenP5-style)
+# ------------------------------
+def make_item_final_tokens(n_items: int) -> List[str]:
+    return [f"<item_{i}>" for i in range(n_items)]
+
+def build_cooccurrence(users_idx: Dict[int, List[int]], n_items: int) -> np.ndarray:
+    C = np.zeros((n_items, n_items), dtype=np.float32)
+    for seq in users_idx.values():
+        uniq = list(set(seq))
+        for a in range(len(uniq)):
+            ia = uniq[a]
+            C[ia, ia] += 1.0
+            for b in range(a + 1, len(uniq)):
+                ib = uniq[b]
+                C[ia, ib] += 1.0
+                C[ib, ia] += 1.0
+    C /= max(1, len(users_idx))
+    return C
+
+def _spectral_split(aff: np.ndarray, num_clusters: int) -> np.ndarray:
+    if SKLEARN_AVAILABLE:
+        sc = SpectralClustering(n_clusters=num_clusters, affinity='precomputed', assign_labels='kmeans', random_state=42)
+        labels = sc.fit_predict(aff)
+        return labels
+    else:
+        svd = TruncatedSVD(n_components=min(32, max(2, aff.shape[0] - 1)))
+        X = svd.fit_transform(aff)
+        km = KMeans(n_clusters=num_clusters, n_init=10, random_state=42)
+        return km.fit_predict(X)
+
+def build_cid_tokens(users_idx: Dict[int, List[int]], n_items: int, num_clusters: int = 20, leaf_size: int = 500):
+    C = build_cooccurrence(users_idx, n_items)
+    from collections import deque
+    q = deque()
+    all_items = list(range(n_items))
+    q.append(all_items)
+
+    level = 0
+    per_item_tokens: List[List[str]] = [[] for _ in range(n_items)]
+    all_ci_tokens: List[str] = []
+
+    while q:
+        clusters_next = []
+        breadth_sets = list(q); q.clear()
+        for S in breadth_sets:
+            if len(S) <= leaf_size:
+                tok = f"<CI{level}_{len(all_ci_tokens)}>"
+                all_ci_tokens.append(tok)
+                for i in S:
+                    per_item_tokens[i].append(tok)
+                continue
+            sub = C[np.ix_(S, S)]
+            sub = np.clip(sub, 0.0, None)
+            if sub.max() == 0:
+                chunks = [S[i::num_clusters] for i in range(num_clusters)]
+                labels = np.concatenate([np.full(len(chunks[i]), i) for i in range(num_clusters)])
+            else:
+                labels = _spectral_split(sub, num_clusters)
+            for c in range(num_clusters):
+                idxs = [S[i] for i in range(len(S)) if labels[i] == c]
+                if len(idxs) == 0:
+                    continue
+                tok = f"<CI{level}_{len(all_ci_tokens)}>"
+                all_ci_tokens.append(tok)
+                for i in idxs:
+                    per_item_tokens[i].append(tok)
+                clusters_next.append(idxs)
+        for cl in clusters_next:
+            q.append(cl)
+        level += 1
+    return per_item_tokens, all_ci_tokens
+
+# ------------------------------
+# Prompt set
+# ------------------------------
+SEQ_PROMPTS_SEEN = [
+    "Considering {dataset} user_{user_id} has interacted with {dataset} items {history} . What is the next recommendation for the user ? Answer:",
+    "Here is the purchase history of {dataset} user_{user_id} : {dataset} item {history} . I wonder what is the next recommended item for the user . Answer:",
+    "{dataset} user_{user_id} has purchased {dataset} items {history} , predict next possible item to be bought by the user ? Answer:",
+    "I find the purchase list of {dataset} user_{user_id} : {dataset} items {history} , I wonder what other itmes does the user need . Can you help me decide ? Answer:",
+    "According to what items {dataset} user_{user_id} has purchased : {dataset} items {history} , Can you recommend another item to the user ? Answer:",
+    "What would {dataset} user_{user_id} be likely to purchase next after buying {dataset} items {history} ? Answer:",
+    "By analyzing the {dataset} user_{user_id} ’s purchase of {dataset} items {history} , what is the next item expected to be bought ? Answer:",
+    "Can you recommend the next item for {dataset} user_{user_id} , given the user ’s purchase of {dataset} items {history} ? Answer:",
+    "After buying {dataset} items {history} , what is the next item that could be recommended for {dataset} user_{user_id} ? Answer:",
+    "The {dataset} user_{user_id} has bought items : {dataset} items {history} , What else do you think is necessary for the user ? Answer:",
+]
+SEQ_PROMPT_UNSEEN = "What is the top recommended item for {dataset} user_{user_id} who interacted with {dataset} item {history} ? Answer:"
+
+# ------------------------------
+# Dataset building
+# ------------------------------
+@dataclass
+class Example:
+    input_ids: List[int]
+    attention_mask: List[int]
+    labels: List[int]
+    target_item_idx: int  # [0..N_items-1]
+
+class SeqRecDataset(Dataset):
+    def __init__(self,
+                 user2seq: Dict[int, List[int]],
+                 tokenizer,
+                 item_token_seq: List[List[str]],  # per-item token sequence
+                 max_history: int = 50,
+                 phase: str = "train",
+                 use_unseen_prompt: bool = False):
+        self.examples: List[Example] = []
+        self.tok = tokenizer
+        self.item_token_seq = item_token_seq
+        self.phase = phase
+        self.use_unseen_prompt = use_unseen_prompt
+        self._build(user2seq, max_history)
+
+    def _format_history(self, hist_items: List[int]) -> str:
+        parts = []
+        for i in hist_items:
+            parts.extend(self.item_token_seq[i])
+        return " ".join(parts)
+
+    def _build(self, user2seq: Dict[int, List[int]], max_history: int):
+        for uid, seq in user2seq.items():
+            start = 1 if self.phase == "train" else max(1, len(seq) - 30)
+            for t in range(start, len(seq)):
+                hist_items = seq[max(0, t - max_history):t]
+                if not hist_items:
+                    continue
+                target = seq[t]
+                hist_tokens = self._format_history(hist_items)
+                prompt_tpl = (SEQ_PROMPT_UNSEEN if (self.phase != "train" and self.use_unseen_prompt) else random.choice(SEQ_PROMPTS_SEEN))
+                prompt = prompt_tpl.format(dataset=DATASET_NAME, user_id=uid, history=hist_tokens)
+                answer_tokens = self.item_token_seq[target]
+                answer_text = " ".join(answer_tokens)
+                enc_prompt = self.tok(prompt, add_special_tokens=True)
+                enc_answer = self.tok(" " + answer_text, add_special_tokens=False)
+                input_ids = enc_prompt["input_ids"] + enc_answer["input_ids"]
+                attention_mask = enc_prompt["attention_mask"] + enc_answer["attention_mask"]
+                labels = [-100] * len(enc_prompt["input_ids"]) + enc_answer["input_ids"]
+                self.examples.append(Example(input_ids, attention_mask, labels, target))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        e = self.examples[idx]
+        return {
+            "input_ids": torch.tensor(e.input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(e.attention_mask, dtype=torch.long),
+            "labels": torch.tensor(e.labels, dtype=torch.long),
+            "target_item_idx": torch.tensor(e.target_item_idx, dtype=torch.long),
+        }
+
+def collate_batch(batch, pad_id: int):
+    max_len = max(len(x["input_ids"]) for x in batch)
+    def pad(seq, val):
+        return seq + [val] * (max_len - len(seq))
+    input_ids = torch.tensor([pad(x["input_ids"].tolist(), pad_id) for x in batch], dtype=torch.long)
+    attention_mask = torch.tensor([pad(x["attention_mask"].tolist(), 0) for x in batch], dtype=torch.long)
+    labels = torch.tensor([pad(x["labels"].tolist(), -100) for x in batch], dtype=torch.long)
+    target_item_idx = torch.stack([x["target_item_idx"] for x in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "target_item_idx": target_item_idx}
+
+class SeqRecDatasetFromTestPairs(Dataset):
+    """
+    逐行读取 test.jsonl 的 prompt 与 target：
+      prompt: "<item_...> <item_...> ..."
+      target: "<item_X>"
+    使用 mid2idx 把外部 mid 映射到内部 item 索引，
+    再用 item_token_seq 将历史 items 展开成你现在的“项级 token 序列”（可含 CI token + <item_i>）。
+    """
+    def __init__(self, test_jsonl_path: str, mid2idx: Dict[int,int],
+                 tokenizer, item_token_seq: List[List[str]], max_history: int = 50,
+                 use_unseen_prompt: bool = False):
+        self.examples = []
+        self.tok = tokenizer
+        self.item_token_seq = item_token_seq
+        self.max_history = max_history
+        self.use_unseen_prompt = use_unseen_prompt
+        rows = _load_jsonl(test_jsonl_path)
+        for r in rows:
+            pr = (r.get("prompt") or "").strip()
+            tg = (r.get("target") or "").strip()
+            if not pr or not tg:
+                continue
+            # 解析 mid
+            try:
+                mids_ctx = [_tok_to_mid(t) for t in pr.split()]
+                mid_tgt = _tok_to_mid(tg)
+            except:
+                continue
+            # 映射到内部 idx
+            idx_ctx = [mid2idx[m] for m in mids_ctx if m in mid2idx]
+            if not idx_ctx or (mid_tgt not in mid2idx):
+                continue
+            idx_tgt = mid2idx[mid_tgt]
+            # 截断到 max_history（右侧保留最近）
+            idx_ctx = idx_ctx[-max_history:]
+
+            # 展开成“项级 token 序列”（与你训练时一致）
+            hist_tokens = []
+            for i in idx_ctx:
+                hist_tokens.extend(item_token_seq[i])
+            history_text = " ".join(hist_tokens)
+
+            prompt_tpl = (SEQ_PROMPT_UNSEEN if self.use_unseen_prompt else random.choice(SEQ_PROMPTS_SEEN))
+            prompt = prompt_tpl.format(dataset=DATASET_NAME, user_id=int(r.get("user_id", 0)), history=history_text)
+
+            answer_text = " ".join(item_token_seq[idx_tgt])
+
+            enc_prompt = self.tok(prompt, add_special_tokens=True)
+            enc_answer = self.tok(" " + answer_text, add_special_tokens=False)
+            input_ids = enc_prompt["input_ids"] + enc_answer["input_ids"]
+            attention_mask = enc_prompt["attention_mask"] + enc_answer["attention_mask"]
+            labels = [-100]*len(enc_prompt["input_ids"]) + enc_answer["input_ids"]
+
+            self.examples.append({
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+                "target_item_idx": torch.tensor(idx_tgt, dtype=torch.long),
+            })
+
+    def __len__(self): return len(self.examples)
+    def __getitem__(self, i): return self.examples[i]
+
+
+# ------------------------------
+# Metrics
+# ------------------------------
+def recall_at_k(rank: int, k: int) -> float:
+    return 1.0 if rank <= k else 0.0
+
+def ndcg_at_k(rank: int, k: int) -> float:
+    if rank > k:
+        return 0.0
+    return 1.0 / math.log2(rank + 1)
+
+# ------------------------------
+# Training / Evaluation (DDP aware)
+# ------------------------------
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, fp16=False, is_main=True):
+    model.train()
+    total = 0.0
+    scaler = torch.cuda.amp.GradScaler(enabled=fp16)
+    for batch in tqdm(dataloader, desc="Train", disable=not is_main):
+        for k in batch:
+            batch[k] = batch[k].to(device, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=fp16):
+            out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
+            loss = out.loss
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        if scheduler is not None:
+            scheduler.step()
+        total += loss.item()
+    return total / max(1, len(dataloader))
+
+@torch.no_grad()
+def evaluate(model, dataloader, device, item_final_token_ids: List[int], topk_list: List[int], fp16=False, is_distributed=False, is_main=True):
+    model.eval()
+    K_list = sorted(topk_list)
+    sums = {f"Recall@{k}": 0.0 for k in K_list}
+    sums.update({f"NDCG@{k}": 0.0 for k in K_list})
+    n_local = 0
+
+    for batch in tqdm(dataloader, desc="Eval", disable=not is_main):
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        target_idx = batch["target_item_idx"].to(device, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=fp16):
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out.logits  # only last position (final item token)
+        # 末位是“最后一个输入 token”的位置（你目前 eval 样本是 prompt+answer）
+        last_pos = attention_mask.sum(dim=1) - 1               # [B]
+        # 取“最后一个 token 的前一位”，它负责预测最后一个 token（CID 时就是 <item_i>）
+        query_pos = (last_pos - 1).clamp(min=0)                # [B]
+        rows = torch.arange(input_ids.size(0), device=device)
+        logits = logits[rows, query_pos, :]
+        # Restrict to final item-token vocab
+        mask = torch.full_like(logits, float('-inf'))
+        item_ids = torch.tensor(item_final_token_ids, device=logits.device)
+        mask.scatter_(1, item_ids.unsqueeze(0).expand(logits.size(0), -1),
+                      logits.gather(1, item_ids.unsqueeze(0).expand(logits.size(0), -1)))
+        # gold final item token ids
+        gold_token_ids = torch.tensor([item_final_token_ids[i.item()] for i in target_idx], device=logits.device)
+        Kmax = max(K_list)
+        topk_ids = torch.topk(mask, k=Kmax, dim=1).indices  # [B,Kmax]
+        gold = gold_token_ids.unsqueeze(1)
+        eq = (topk_ids == gold)
+        ranks = torch.where(eq.any(dim=1), eq.float().argmax(dim=1) + 1,
+                            torch.full((eq.size(0),), Kmax + 1, device=eq.device))
+        for r in ranks.tolist():
+            for k in K_list:
+                sums[f"Recall@{k}"] += recall_at_k(r, k)
+                sums[f"NDCG@{k}"] += ndcg_at_k(r, k)
+        n_local += len(ranks)
+
+    # aggregate across ranks
+    if is_distributed and dist.is_initialized():
+        vec = []
+        for k in K_list:
+            vec.append(sums[f"Recall@{k}"])
+        for k in K_list:
+            vec.append(sums[f"NDCG@{k}"])
+        vec.append(float(n_local))
+        t = torch.tensor(vec, device=device, dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        out_sums = {}
+        idx = 0
+        for k in K_list:
+            out_sums[f"Recall@{k}"] = t[idx].item(); idx += 1
+        for k in K_list:
+            out_sums[f"NDCG@{k}"] = t[idx].item(); idx += 1
+        n_all = max(1.0, t[idx].item())
+        metrics = {k: (out_sums[k] / n_all) for k in out_sums}
+        return metrics
+    else:
+        n_all = max(1, n_local)
+        return {k: (v / n_all) for k, v in sums.items()}
+
+# ------------------------------
+# Main
+# ------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/llama-2-7b-chat-hf')
+    # data_dir 指向 original.jsonl / test.jsonl / item_ids.json 的目录
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
+    ap.add_argument('--output_dir', type=str, default='./runs/openP5_ml10M100K')
+    ap.add_argument('--item_indexing', type=str, choices=['sequential', 'random', 'collaborative'], default='sequential')
+    ap.add_argument('--ci_num_clusters', type=int, default=20, help='CID: #clusters per split (N)')
+    ap.add_argument('--ci_leaf_size', type=int, default=500, help='CID: max items per leaf (k)')
+    ap.add_argument('--min_user_len', type=int, default=5)
+    ap.add_argument('--max_history', type=int, default=50)
+    ap.add_argument('--epochs', type=int, default=2)
+    ap.add_argument('--batch_size', type=int, default=16)
+    ap.add_argument('--lr', type=float, default=2e-4)
+    ap.add_argument('--warmup_ratio', type=float, default=0.05)
+    ap.add_argument('--weight_decay', type=float, default=0.01)
+    ap.add_argument('--fp16', action='store_true')
+    ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--topk', type=int, nargs='+', default=[5, 10, 20])
+    ap.add_argument('--use_lora', action='store_true', default=True)
+    ap.add_argument('--lora_r', type=int, default=8)
+    ap.add_argument('--lora_alpha', type=int, default=16)
+    ap.add_argument('--lora_dropout', type=float, default=0.05)
+    ap.add_argument('--grad_checkpointing', action='store_true')
+    ap.add_argument('--eval_unseen_prompt', action='store_true', help='Use A11 unseen prompt for val/test prompts')
+    args = ap.parse_args()
+
+    # DDP init
+    is_distributed, rank, world_size, local_rank = init_distributed()
+    is_main = (rank == 0)
+    set_seed(args.seed, rank)
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{local_rank}' if is_distributed else 'cuda')
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device('cpu')
+
+    if is_main:
+        ensure_dir(args.output_dir)
+
+    # 1) Data：从 original/test JSONL + item_ids.json 构建序列
+    train_seq, val_seq, test_seq, n_items, mid2idx = load_preprocessed_splits(
+        args.data_dir,
+        item_indexing=args.item_indexing,
+        seed=args.seed,
+        min_user_len=args.min_user_len
+    )
+    if is_main:
+        print(f"[Data] items={n_items} | train_users={len(train_seq)} val_users={len(val_seq)} test_users={len(test_seq)}")
+
+    # 2) Token sequences per item
+    if args.item_indexing == 'collaborative':
+        # 用训练集构图做 CID（避免泄漏）
+        ci_per_item, ci_vocab = build_cid_tokens(train_seq, n_items, num_clusters=args.ci_num_clusters, leaf_size=args.ci_leaf_size)
+        final_item_tokens = make_item_final_tokens(n_items)
+        extra_tokens = list(dict.fromkeys(ci for path in ci_per_item for ci in path)) + final_item_tokens
+        item_token_seq = []
+        for i in range(n_items):
+            item_token_seq.append(ci_per_item[i] + [final_item_tokens[i]])
+    else:
+        final_item_tokens = make_item_final_tokens(n_items)
+        extra_tokens = final_item_tokens
+        item_token_seq = [[tok] for tok in final_item_tokens]
+
+    # 3) Tokenizer & model
+    if is_main:
+        print("[Model] Loading tokenizer and model ...")
+    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+
+    # Extend vocab with needed tokens (CI tokens + <item_i>)
+    num_added = tok.add_tokens(extra_tokens, special_tokens=False)
+    model.resize_token_embeddings(len(tok))
+
+    # Map final item token strings -> ids (for ranking)
+    item_final_token_ids: List[int] = [tok.convert_tokens_to_ids(t) for t in final_item_tokens]
+
+    # Optional: init new token embeddings
+    with torch.no_grad():
+        emb = model.get_input_embeddings().weight
+        existing_mean = emb[:-num_added].mean(dim=0, keepdim=True) if num_added > 0 else emb.mean(dim=0, keepdim=True)
+        for t in extra_tokens[-num_added:]:
+            tid = tok.convert_tokens_to_ids(t)
+            emb[tid] = existing_mean[0]
+    with torch.no_grad():
+        in_emb = model.get_input_embeddings().weight
+        out_emb = model.get_output_embeddings().weight  # lm_head.weight
+        for t in extra_tokens[-num_added:]:
+            tid = tok.convert_tokens_to_ids(t)
+            out_emb[tid] = in_emb[tid]  # 保证新 token 的输出行不是随机
+
+    # LoRA
+    if args.use_lora:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("PEFT is not installed. pip install peft")
+        peft_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            bias='none', task_type='CAUSAL_LM', target_modules=["q_proj","k_proj","v_proj","o_proj"]
+        )
+        model = get_peft_model(model, peft_cfg)
+        if is_main:
+            model.print_trainable_parameters()
+
+    model.to(device)
+    model.config.use_cache = False
+
+    # Wrap DDP
+    if is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=False
+        )
+
+    # 4) Datasets & loaders (DDP samplers)
+    pad_id = tok.pad_token_id
+    collate = lambda batch: collate_batch(batch, pad_id)
+
+    train_ds = SeqRecDataset(train_seq, tok, item_token_seq, max_history=args.max_history, phase="train", use_unseen_prompt=False)
+    test_jsonl_path = os.path.join(args.data_dir, "test.jsonl")
+    test_ds = SeqRecDatasetFromTestPairs(
+        test_jsonl_path,
+        mid2idx,
+        tok,
+        item_token_seq,
+        max_history=args.max_history,
+        use_unseen_prompt=args.eval_unseen_prompt
+    )
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=dist.get_world_size() if is_distributed else 1,
+                                       rank=dist.get_rank() if is_distributed else 0, shuffle=True) if is_distributed else None
+    test_sampler  = DistributedSampler(test_ds,  num_replicas=dist.get_world_size() if is_distributed else 1,
+                                       rank=dist.get_rank() if is_distributed else 0, shuffle=False) if is_distributed else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=(train_sampler is None), sampler=train_sampler,
+                              num_workers=0, pin_memory=True, collate_fn=collate)
+    test_loader  = DataLoader(test_ds, batch_size=args.batch_size,
+                              shuffle=False, sampler=test_sampler,
+                              num_workers=0, pin_memory=True, collate_fn=collate)
+
+    # 5) Optim & sched
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    num_train_steps = args.epochs * max(1, len(train_loader))
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(args.warmup_ratio * num_train_steps), num_train_steps)
+
+    # 6) Train & early select by Val (NDCG@10+Recall@10)
+    best_score, best_path = None, None
+    for ep in range(1, args.epochs + 1):
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(ep)
+        if is_main:
+            print(f"===== Epoch {ep}/{args.epochs} =====")
+        tr_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, fp16=args.fp16, is_main=is_main)
+        if is_main:
+            print(f"[Train] loss={tr_loss:.4f}")
+
+        if is_distributed:
+            dist.barrier()
+
+    # # 7) Test
+    # if is_distributed:
+    #     dist.barrier()
+        test_metrics = evaluate(model, test_loader, device, item_final_token_ids, args.topk,
+                                fp16=args.fp16, is_distributed=is_distributed, is_main=is_main)
+    if is_distributed:
+        dist.barrier()
+    if is_main:
+        print("===== Test Results =====")
+        for k in sorted(test_metrics.keys()):
+            print(f"{k}: {test_metrics[k]:.4f}")
+        with open(os.path.join(args.output_dir, 'test_metrics.json'), 'w', encoding='utf-8') as f:
+            json.dump(test_metrics, f, ensure_ascii=False, indent=2)
+
+
+    # === 合并 LoRA 并保存（只在 rank 0） ===
+    if is_distributed:
+        dist.barrier()
+
+    if is_main:
+        to_save = model.module if hasattr(model, "module") else model
+        final_dir = os.path.join(args.output_dir, "lora_only")
+        ensure_dir(final_dir)
+
+        if getattr(args, "use_lora", False) and hasattr(to_save, "peft_config"):
+            # 仅保存 LoRA 适配器（adapter_model.safetensors + adapter_config.json）
+            to_save.save_pretrained(final_dir, safe_serialization=True)
+            # 保存 tokenizer，便于后续和 base 模型一起加载
+            tok.save_pretrained(final_dir)
+            print(f"[Save] LoRA adapter + tokenizer → {final_dir}")
+        torch.cuda.empty_cache()
+
+    cleanup_distributed()
+
+if __name__ == '__main__':
+    main()
+
+
