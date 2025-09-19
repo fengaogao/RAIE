@@ -1,0 +1,1234 @@
+import os, math, json
+import argparse
+from dataclasses import dataclass
+import pandas as pd
+import torch.nn as nn
+import numpy as np
+import torch
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader, Subset
+from collections import defaultdict
+from torch.nn.utils import clip_grad_norm_
+import torch.nn.functional as F
+from torch.utils.data import ConcatDataset
+from transformers import BertConfig, BertForMaskedLM, get_linear_schedule_with_warmup
+from typing import List, Dict, Tuple, Optional
+from peft import LoraConfig, get_peft_model, TaskType
+
+# ------------------------------
+# Utilities
+# ------------------------------
+
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def read_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def load_item_vocab(data_dir: str):
+    """Build token <-> id mapping from item_ids.json.
+    Special tokens come first.
+    Returns:
+      token2id: dict
+      id2token: list
+      item_token_ids: List[int]  # ids of the real item tokens (exclude specials)
+    """
+    item_json = os.path.join(data_dir, 'item_ids.json')
+    with open(item_json, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    item_ids: List[int] = obj['item_ids']
+
+    specials = ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]']
+    token2id = {tok: i for i, tok in enumerate(specials)}
+    id2token = specials.copy()
+
+    for mid in sorted(item_ids):
+        tok = f"<item_{mid}>"
+        token2id[tok] = len(id2token)
+        id2token.append(tok)
+
+    item_token_ids = list(range(len(specials), len(id2token)))
+    return token2id, id2token, item_token_ids
+
+
+# ------------------------------
+# Dataset & Collators
+# ------------------------------
+
+@dataclass
+class Example:
+    prompt_tokens: List[str]
+    target_token: str
+
+# 放在 Example 定义之后
+
+@dataclass
+class StreamExample:
+    items: List[str]  # 仅序列，无 target
+
+class StreamDataset(Dataset):
+    """
+    读取 original_stream.jsonl（每行一位用户的完整序列）：
+    {
+      "user_id": ...,
+      "items": "<item_1> <item_2> ...",
+      "timestamps": "..."   # 可有可无，这里忽略
+    }
+    """
+    def __init__(self, jsonl_path: str):
+        rows = read_jsonl(jsonl_path)
+        self.examples: List[StreamExample] = []
+        for r in rows:
+            s = (r.get('items') or "").strip()
+            if not s:
+                continue
+            toks = s.split()
+            if len(toks) == 0:
+                continue
+            self.examples.append(StreamExample(toks))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> StreamExample:
+        return self.examples[idx]
+
+
+class NextItemDataset(Dataset):
+    def __init__(self, jsonl_path: str):
+        rows = read_jsonl(jsonl_path)
+        self.examples: List[Example] = []
+        for r in rows:
+            prompt = r['prompt'].strip()
+            target = r['target'].strip()
+            if not prompt or not target:
+                continue
+            self.examples.append(Example(prompt.split(), target))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Example:
+        return self.examples[idx]
+
+
+class ClozeTrainCollator:
+    def __init__(self, token2id: Dict[str, int], max_len: int, pad_id: int, mask_id: int,
+                 cls_id: int, mask_prob: float = 0.15):
+        self.tok2id = token2id
+        self.max_len = max_len
+        self.pad_id = pad_id
+        self.mask_id = mask_id
+        self.cls_id = cls_id
+        self.vocab_size = len(token2id)
+        self.mask_prob = mask_prob
+
+    def _enc(self, t: str) -> int:
+        return self.tok2id.get(t, self.tok2id['[UNK]'])
+
+    def __call__(self, batch: List[StreamExample]):
+        B = len(batch)
+        L = self.max_len            # 只用序列，不拼 target
+        seq_len = L + 1             # + [CLS]
+
+        input_ids = torch.full((B, seq_len), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, seq_len), dtype=torch.long)
+        labels = torch.full((B, seq_len), -100, dtype=torch.long)  # 只监督被 mask 的位置
+
+        for i, ex in enumerate(batch):
+            ids = [self._enc(t) for t in ex.items[-self.max_len:]]
+            real_len = len(ids)
+            if real_len == 0:
+                # 极端情况：整行空，跳过
+                continue
+
+            # 选 mask 位置
+            n_mask = max(1, int(math.ceil(real_len * self.mask_prob)))
+            cand_idx = np.arange(real_len)
+            mask_pos = np.random.choice(cand_idx, size=n_mask, replace=False)
+
+            # 80/10/10 替换策略
+            seq = ids[:]
+            for p in mask_pos:
+                r = np.random.rand()
+                if r < 0.8:
+                    seq[p] = self.mask_id
+                elif r < 0.9:
+                    seq[p] = np.random.randint(0, self.vocab_size)
+                else:
+                    pass  # 保持原值
+
+            pos = 0
+            input_ids[i, pos] = self.cls_id; pos += 1
+            input_ids[i, pos:pos+real_len] = torch.tensor(seq, dtype=torch.long)
+            attention_mask[i, :pos+real_len] = 1
+
+            # label 对齐：[CLS] 偏移 1
+            for p in mask_pos:
+                labels[i, 1 + p] = ids[p]
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,
+        }
+
+
+class EvalCollator:
+    """
+    Evaluation (and optional 'next' objective training) collator:
+    [CLS] + prompt[-max_len:] + [MASK], label = target_id at the final position.
+    """
+    def __init__(
+        self,
+        token2id: Dict[str, int],
+        max_len: int,
+        mask_id: int,
+        cls_id: int,
+        pad_id: int,
+        do_prompt_mask: bool = False,
+        prompt_mask_prob: float = 0.15,
+    ):
+        self.tok2id = token2id
+        self.max_len = max_len
+        self.mask_id = mask_id
+        self.cls_id = cls_id
+        self.pad_id = pad_id
+        self.do_prompt_mask = do_prompt_mask
+        self.prompt_mask_prob = prompt_mask_prob
+        self.vocab_size = len(token2id)
+
+    def encode_token(self, t: str) -> int:
+        return self.tok2id.get(t, self.tok2id['[UNK]'])
+
+    def __call__(self, batch: List[Example]):
+        B = len(batch)
+        seq_len = self.max_len + 2  # [CLS] + max_len prompt + [MASK]
+
+        input_ids = torch.full((B, seq_len), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, seq_len), dtype=torch.long)
+        labels = torch.full((B,), -100, dtype=torch.long)
+
+        for i, ex in enumerate(batch):
+            prompt_ids = [self.encode_token(t) for t in ex.prompt_tokens[-self.max_len:]]
+            tgt_id = self.encode_token(ex.target_token)
+
+            pos = 0
+            input_ids[i, pos] = self.cls_id; pos += 1
+
+            if self.do_prompt_mask and self.prompt_mask_prob > 0:
+                masked_prompt = []
+                for pid in prompt_ids:
+                    if np.random.rand() < self.prompt_mask_prob:
+                        p = np.random.rand()
+                        if p < 0.8:
+                            masked_prompt.append(self.mask_id)
+                        elif p < 0.9:
+                            masked_prompt.append(np.random.randint(0, self.vocab_size))
+                        else:
+                            masked_prompt.append(pid)
+                    else:
+                        masked_prompt.append(pid)
+                prompt_ids = masked_prompt
+
+            Lp = len(prompt_ids)
+            input_ids[i, pos:pos+Lp] = torch.tensor(prompt_ids, dtype=torch.long)
+            pos += Lp
+
+            input_ids[i, pos] = self.mask_id
+            attention_mask[i, :pos+1] = 1
+            labels[i] = tgt_id
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,
+        }
+
+
+# ------------------------------
+# Metrics (sample-weighted aggregation)
+# ------------------------------
+
+def recall_ndcg_at_k(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    item_token_ids: List[int],
+    topk: Tuple[int, ...] = (5, 10, 20),
+) -> Dict[str, torch.Tensor]:
+    """Return SUM of hits and dcg for each K (to be aggregated by caller)."""
+    device = logits.device
+    V = logits.shape[1]
+
+    # Mask out non-item tokens
+    mask = torch.full((V,), float('-inf'), device=device)
+    mask[item_token_ids] = 0.0
+    logits = logits + mask
+
+    max_k = max(topk)
+    _, topk_idx = torch.topk(logits, k=max_k, dim=1)
+
+    B = labels.numel()
+    labels_exp = labels.view(-1, 1).expand(-1, max_k)
+    match = (topk_idx == labels_exp).float()  # [B, max_k]
+
+    out_hit = {}
+    out_dcg = {}
+    for K in topk:
+        mK = match[:, :K]
+        hit = mK.max(dim=1).values            # [B]
+        pos = torch.argmax(mK, dim=1)         # [B], 0 if none but hit=0
+        dcg = hit * (1.0 / torch.log2(pos.float() + 2.0))
+        out_hit[K] = hit.sum()
+        out_dcg[K] = dcg.sum()
+    return {'hit': out_hit, 'dcg': out_dcg, 'n': torch.tensor(B, device=device)}
+
+
+# ------------------------------
+# Training & Evaluation
+# ------------------------------
+
+def train_one_epoch(
+    model: BertForMaskedLM,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    item_token_ids: List[int],
+    objective: str,
+    grad_clip: float = 1.0,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    n_steps = 0
+
+    for batch in tqdm(loader, desc='Train', leave=False):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        optimizer.zero_grad()
+
+        if objective == 'cloze':
+            labels = batch['labels'].to(device)  # [B, L], masked positions supervised
+            out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = out.loss
+        else:  # 'next'
+            labels = batch['labels'].to(device)  # [B]
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out.logits  # [B, L, V]
+            final_pos = attention_mask.sum(dim=1) - 1
+            rows = torch.arange(input_ids.size(0), device=device)
+            logits_final = logits[rows, final_pos, :]
+
+            V = logits_final.size(-1)
+            mask_vec = torch.full((V,), float('-inf'), device=device)
+            mask_vec[item_token_ids] = 0.0
+            logits_final = logits_final + mask_vec
+            loss = nn.functional.cross_entropy(logits_final, labels)
+
+        loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item()
+        n_steps += 1
+
+    return {"train_loss": total_loss / max(n_steps, 1)}
+
+@torch.no_grad()
+def evaluate(
+    model: BertForMaskedLM,
+    loader: DataLoader,
+    device: torch.device,
+    item_token_ids: List[int],
+    topk: Tuple[int, ...] = (5, 10, 20),
+) -> Dict[str, float]:
+    model.eval()
+    sum_hit = {K: 0.0 for K in topk}
+    sum_dcg = {K: 0.0 for K in topk}
+    N = 0
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc='Eval', leave=False):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out.logits  # [B, L, V]
+            final_pos = attention_mask.sum(dim=1) - 1
+            rows = torch.arange(input_ids.size(0), device=device)
+            logits_final = logits[rows, final_pos, :]
+
+            m = recall_ndcg_at_k(logits_final, labels, item_token_ids, topk)
+            for K in topk:
+                sum_hit[K] += float(m['hit'][K].item())
+                sum_dcg[K] += float(m['dcg'][K].item())
+            N += int(m['n'].item())
+
+    out = {}
+    for K in topk:
+        out[f'Recall@{K}'] = sum_hit[K] / max(N, 1)
+        out[f'NDCG@{K}'] = sum_dcg[K] / max(N, 1)
+    return out
+
+def l2_normalize(X: np.ndarray, eps: float = 1e-12):
+    n = np.linalg.norm(X, axis=1, keepdims=True) + eps
+    return (X / n).astype(np.float32)
+
+def spherical_kmeans(X: np.ndarray, K: int, niter=30, seed=42):
+    try:
+        import faiss
+        km = faiss.Kmeans(d=X.shape[1], k=K, niter=niter, nredo=2,
+                          verbose=True, spherical=True, seed=seed)
+        km.train(X.astype(np.float32))
+        C = km.centroids.astype(np.float32)
+        index = faiss.IndexFlatIP(X.shape[1]); index.add(C)
+        _, lab = index.search(X, 1)
+        return C, lab.reshape(-1).astype(np.int32)
+    except Exception:
+        from sklearn.cluster import KMeans
+        skm = KMeans(n_clusters=K, n_init=10, max_iter=300, random_state=seed)
+        lab = skm.fit_predict(X)
+        C = l2_normalize(skm.cluster_centers_)
+        return C.astype(np.float32), lab.astype(np.int32)
+
+def per_cluster_radius(X, C, labels, q=0.9):
+    K = C.shape[0]; R = np.zeros(K, np.float32)
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        if len(idx) == 0: continue
+        dots = X[idx] @ C[k]
+        ang = np.arccos(np.clip(dots, -1, 1))
+        R[k] = np.quantile(ang, q).astype(np.float32)
+    return R
+
+def per_cluster_ang_std(X, C, labels):
+    K = C.shape[0]; sig = np.zeros(K, np.float32)
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        if len(idx) == 0: continue
+        dots = X[idx] @ C[k]
+        ang = np.arccos(np.clip(dots, -1, 1))
+        sig[k] = ang.std().astype(np.float32)
+    return sig
+
+def enforce_separation(C: np.ndarray, R: np.ndarray, eps_margin=0.03, iters=1):
+    K = C.shape[0]
+    for _ in range(iters):
+        changed = False
+        for i in range(K):
+            for j in range(i+1, K):
+                a = float(np.arccos(np.clip(C[i] @ C[j], -1, 1)))
+                limit = max(0.0, a - eps_margin)
+                s = R[i] + R[j]
+                if s > limit and s > 1e-8:
+                    scale = limit / s
+                    R[i] *= scale; R[j] *= scale
+                    changed = True
+        if not changed: break
+    return R
+
+def finetune_one_epoch_bert(
+    model: BertForMaskedLM,
+    finetune_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    item_token_ids: List[int],
+    grad_clip: float = 1.0,
+) -> float:
+    model.train()
+    total = 0.0
+    n_steps = 0
+
+    for batch in tqdm(finetune_loader, desc="Finetune(F)", leave=False):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)  # [B]
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Base next-item loss at final [MASK]
+        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = out.logits  # [B, L, V]
+        final_pos = attention_mask.sum(dim=1) - 1
+        rows = torch.arange(input_ids.size(0), device=device)
+        logits_final = logits[rows, final_pos, :]
+
+        V = logits_final.size(-1)
+        mask_vec = torch.full((V,), float('-inf'), device=device); mask_vec[item_token_ids] = 0.0
+        logits_final = logits_final + mask_vec
+        loss = F.cross_entropy(logits_final, labels)
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total += float(loss.detach().item())
+        n_steps += 1
+
+    return total / max(1, n_steps)
+
+# ---------------------------
+# Prompt 向量抽取（BERT4Rec 自建 vocab）
+# ---------------------------
+def batch_prompt_ids(batch_tokens: List[List[str]], token2id: Dict[str,int],
+                     max_len: int, pad_id: int, cls_id: int):
+    """返回 input_ids[B, L] & attention_mask[B, L]，仅 [CLS]+prompt（不加[MASK]）。"""
+    B = len(batch_tokens); L = max_len + 1
+    input_ids = torch.full((B, L), pad_id, dtype=torch.long)
+    attn = torch.zeros((B, L), dtype=torch.long)
+    for i, toks in enumerate(batch_tokens):
+        ids = [token2id.get(t, token2id['[UNK]']) for t in toks[-max_len:]]
+        pos = 0; input_ids[i, pos] = cls_id; pos += 1
+        if len(ids) > 0:
+            m = min(len(ids), L - pos)
+            input_ids[i, pos:pos+m] = torch.tensor(ids[-m:], dtype=torch.long)
+            attn[i, :pos+m] = 1
+        else:
+            attn[i, :1] = 1  # 只有 [CLS]
+    return input_ids, attn
+
+@torch.no_grad()
+def encode_prompts_to_vecs(model, examples, token2id, max_len, pad_id, cls_id,
+                           device, use_mean_pool=True, batch_size=256, pbar=False):
+    """
+    examples: Iterable of objects having .prompt_tokens (List[str]) 或 (prompt,target)对；
+              对 NextItemDataset，可用 ex.prompt_tokens; 如果是字符串请先split。
+    输出：np.ndarray [N, H]，L2 normalize。
+    """
+    vecs = []
+    model.eval()
+    if hasattr(model, "set_adapter"):
+        try: model.set_adapter("default")
+        except: pass
+
+    for i in tqdm(range(0, len(examples), batch_size), disable=not pbar):
+        batch = examples[i:i+batch_size]
+        # 兼容 Example/StreamExample/行dict
+        ptoks = []
+        for ex in batch:
+            if hasattr(ex, "prompt_tokens"): ptoks.append(ex.prompt_tokens)
+            elif isinstance(ex, dict) and "prompt" in ex: ptoks.append(ex["prompt"].split())
+            else: ptoks.append(ex.items if hasattr(ex, "items") else str(ex).split())
+
+        ids, attn = batch_prompt_ids(ptoks, token2id, max_len, pad_id, cls_id)
+        ids, attn = ids.to(device), attn.to(device)
+        out = model.bert(input_ids=ids, attention_mask=attn, output_hidden_states=True, return_dict=True)
+        h = out.last_hidden_state  # [B, L, H]
+        if use_mean_pool:
+            mask = attn.unsqueeze(-1).float()
+            v = (h * mask).sum(dim=1) / (mask.sum(dim=1).clamp(min=1.0))
+        else:
+            v = h[:, 0, :]  # [CLS]
+        vecs.append(v.detach().float().cpu().numpy())
+    X = np.concatenate(vecs, axis=0).astype(np.float32)
+    return l2_normalize(X)
+
+# ---------------------------
+# 区域 Bank：聚类、映射、训练、评测
+# ---------------------------
+class RegionBank:
+    def __init__(self, model, token2id, item_token_ids: List[int], original_ds, pad_id, cls_id,
+                 max_len: int, device, out_dir: str,
+                 K=10, q=0.9, T_low=0.7, T_high=0.9, tau=0.05, gamma=0.5, gap_thr=0.02,
+                 lora_r=8, lora_alpha=16, lora_dropout=0.05, target_modules=("query","key","value","intermediate.dense","output.dense","attention.output.dense")):
+        self.model = model
+        self.token2id = token2id
+        self.item_token_ids = item_token_ids
+        self.pad_id, self.cls_id = pad_id, cls_id
+        self.max_len = max_len
+        self.device = device
+        self.out_dir = out_dir
+        self.original_ds = original_ds
+        self.orig_idx_by_k = {}
+        self.S = None      # [K, H] 各簇向量和
+        self.n = None      # [K]    各簇计数（可为浮点，便于半权重）
+        self.kappa = None  # [K]    各簇浓度参数
+        self.pi = None     # [K]    各簇先验（经验频率）
+        self.C0 = None          # 初始中心备份（先验方向）
+        self.n0 = 5.0           # 每簇伪计数先验（稳定 κ/π）
+        self.kappa_ema = 0.2    # κ 指数平滑系数
+        self.beta_post = 8.0    # 后验温度（原来 20 过尖）
+        self.delta_min = 0.05   # 置信 margin（原 0.15 过严）
+        self.lam_new = -1.0     # 新簇打断分数阈（原 -5 过松）
+
+        # 路由/门限
+        self.K = K; self.q = q
+        self.T_low = T_low; self.T_high = T_high
+        self.tau = tau; self.gamma = gamma; self.gap_thr = gap_thr
+
+        # LoRA 配置（BERT -> MASKED_LM）
+        self.lora_cfg = LoraConfig(
+            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            bias="none", task_type=TaskType.FEATURE_EXTRACTION, inference_mode=False,
+            target_modules=list(target_modules)
+        )
+
+        # 聚类态
+        self.C = None           # [K, H]
+        self.R = None           # [K]
+        self.sig = None         # [K]
+        self.orig_idx_by_k = {} # original 样本索引桶（混入训练）
+
+    # ---- 1) original 聚类 ----
+    def fit_regions_on_original(self, original_ds, seed=42):
+        X = encode_prompts_to_vecs(self.model, original_ds.examples, self.token2id,
+                                   self.max_len, self.pad_id, self.cls_id, self.device, pbar=True)
+        C, labels = spherical_kmeans(X, self.K, niter=30, seed=seed)
+        R = per_cluster_radius(X, C, labels, q=self.q)
+        sig = per_cluster_ang_std(X, C, labels)
+        self.C, self.R, self.sig = C, R, sig
+        self.C0 = C.copy()  # 作为先验方向
+        self._init_vmf_from_labels(X, labels)
+
+        # 为“混入稳定训练”保存 original 桶
+        self.orig_idx_by_k = {k: [] for k in range(self.K)}
+        for i, k in enumerate(labels):
+            self.orig_idx_by_k[int(k)].append(i)
+
+        np.savez(os.path.join(self.out_dir, "raie_regions_init.npz"),
+                 centroids=C, radii=R, sig=sig, K=self.K, dim=C.shape[1])
+        return labels
+
+    # ===== vMF helpers =====
+    def _init_vmf_from_labels(self, X: np.ndarray, labels: np.ndarray):
+        """用初始聚类结果统计 vMF：S,n, mu(=C), kappa, pi"""
+        K, H = self.C.shape[0], X.shape[1]
+        self.S = np.zeros((K, H), np.float32)
+        self.n = np.zeros((K,), np.float32)
+        for i, k in enumerate(labels.astype(int)):
+            self.S[k] += X[i]
+            self.n[k] += 1.0
+        self._recompute_mu_kappa_pi()
+
+    def _recompute_mu_kappa_pi(self):
+        """由（带先验）的 S,n 重算 μ(=C)、κ、π，并对 κ 做 EMA 平滑"""
+        eps = 1e-12
+        if self.C0 is None:
+            self.C0 = self.C.copy()
+
+        # 先验平滑
+        S_hat = self.S + self.n0 * self.C0
+        n_hat = self.n + self.n0
+
+        # μ = S_hat / ||S_hat||
+        normS = np.linalg.norm(S_hat, axis=1, keepdims=True) + eps
+        C_new = S_hat / normS
+        d = C_new.shape[1]
+
+        # rbar = ||S_hat|| / n_hat
+        r = (normS.squeeze(-1)) / np.maximum(n_hat, 1e-6)
+        kappa_new = (r * (d - r ** 2)) / np.clip(1.0 - r ** 2, 1e-6, None)
+        kappa_new = np.clip(kappa_new, 1.0, 1e6).astype(np.float32)
+
+        # κ 做 EMA：减抖
+        if self.kappa is None:
+            self.kappa = kappa_new
+        else:
+            self.kappa = (1.0 - self.kappa_ema) * self.kappa + self.kappa_ema * kappa_new
+
+        # π 用 n_hat 归一
+        nsum = float(np.maximum(n_hat.sum(), 1.0))
+        self.pi = (n_hat / nsum).astype(np.float32)
+
+        # 更新中心
+        self.C = C_new.astype(np.float32)
+
+    def _scores_post(self, x: np.ndarray):
+        sims = self.C @ x  # [K]
+        scores = np.log(np.clip(self.pi, 1e-8, None)) + self.kappa * sims
+        top2 = np.argsort(scores)[-2:]
+        k2, k1 = int(top2[0]), int(top2[1])
+        s1, s2 = float(scores[k1]), float(scores[k2])
+        z = scores - scores.max()
+        p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
+        return k1, k2, s1, s2, float(p[k1]), float(p[k2])
+
+    def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
+        """自适应阈值：浓度越高，要求越高"""
+        return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
+
+    def _decide_action(self, x: np.ndarray):
+        k1, k2, s1, s2, p1, p2 = self._scores_post(x)
+        tau1 = self._tau_assign(k1)
+        if s1 < self.lam_new and p1 < tau1 * 0.7:   # 更强的“真不合群”判断
+            return ("add", k1, k2, p1, p2)
+        if p1 >= tau1 and (p1 - p2) >= self.delta_min:
+            return ("update", k1, k2, p1, p2)
+        if p1 >= tau1:
+            return ("expand", k1, k2, p1, p2)
+        return ("add", k1, k2, p1, p2)
+
+    # ===== 新簇候选：拟合与验收 =====
+    def _propose_new_clusters(self, X_pool: np.ndarray, max_new: int = 2):
+        """
+        在候选池里尝试拟合 1 vs 2 个中心（球面 kmeans），返回候选中心列表（单位化）
+        """
+        cand = []
+        if X_pool.shape[0] == 0:
+            return cand
+        # K=1
+        mu1 = X_pool.mean(0); mu1 /= (np.linalg.norm(mu1) + 1e-12)
+        cand.append(mu1.astype(np.float32))
+        # K=2（如果数据足够）
+        if X_pool.shape[0] >= 50 and max_new >= 2:
+            C2, lab2 = spherical_kmeans(X_pool, 2, niter=20, seed=42)
+            cand.extend([C2[0], C2[1]])
+        return cand[:max_new]
+
+    def _accept_new_clusters(self, X_pool: np.ndarray, centers: List[np.ndarray],
+                             bic_gain: float = 1e4) -> bool:
+        """
+        比较：仅旧簇 vs 旧簇+新簇 的“近似对数似然”（sum score）
+        使用 score = log pi + kappa * (mu^T x) 的和做近似，再加简单 BIC penalty
+        """
+        if len(centers) == 0 or X_pool.shape[0] == 0:
+            return False
+        # baseline: 旧簇
+        sims_old = X_pool @ self.C.T  # [N, K]
+        scores_old = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims_old * self.kappa[None, :]
+        ll_old = float(np.max(scores_old, axis=1).sum())
+
+        # 估一个新簇的 κ 和 π（用池内 rbar）
+        def est_kappa_from_assign(X, mu):
+            dots = X @ mu
+            rbar = float(np.mean(np.clip(dots, -1, 1)))
+            d = X.shape[1]
+            kappa = (rbar * (d - rbar**2)) / max(1e-6, (1 - rbar**2))
+            return max(1.0, min(1e6, kappa))
+
+        # 旧簇 + 新簇
+        addC = np.stack(centers, 0).astype(np.float32)  # [M, H]
+        kappa_new = np.array([est_kappa_from_assign(X_pool, mu) for mu in addC], np.float32)
+        # 简化先验：按各自“匹配度”给权重
+        sims_new = X_pool @ addC.T  # [N, M]
+        score_new = sims_new * kappa_new[None, :]
+        # 归一化出近似先验（池内）
+        w = np.maximum(score_new.mean(0), 1e-6); w = w / w.sum()
+        # 合并
+        all_mu = np.vstack([self.C, addC])                  # [K+M, H]
+        all_kappa = np.concatenate([self.kappa, kappa_new]) # [K+M]
+        all_pi = np.concatenate([self.pi * (1 - w.sum()), w])  # 保守一点
+
+        sims_all = X_pool @ all_mu.T
+        scores_all = np.log(np.clip(all_pi, 1e-8, None))[None, :] + sims_all * all_kappa[None, :]
+        ll_new = float(np.max(scores_all, axis=1).sum())
+
+        # 简单 BIC（参数数≈每簇 d，自由度粗略）
+        d = X_pool.shape[1]
+        K0 = self.C.shape[0]
+        K1 = K0 + len(centers)
+        bic_old = ll_old - 0.5 * (K0 * d) * np.log(X_pool.shape[0] + 1e-8)
+        bic_new = ll_new - 0.5 * (K1 * d) * np.log(X_pool.shape[0] + 1e-8)
+
+        return (bic_new - bic_old) > bic_gain
+
+    def _maybe_merge_by_bic(self, angle_thr: float = np.deg2rad(12), max_pairs: int = 3):
+        """
+        简化的合并：找中心角度很近的簇，做一次合并（最多 max_pairs 次）
+        （严格 BIC 需要保存簇内样本；这里用保守启发式）
+        """
+        K = self.C.shape[0]
+        if K <= 1:
+            return
+        pairs = []
+        for i in range(K):
+            for j in range(i + 1, K):
+                ang = np.arccos(np.clip(self.C[i] @ self.C[j], -1, 1))
+                if ang < angle_thr:
+                    pairs.append((ang, i, j))
+        pairs.sort()
+        merged = 0
+        for _, i, j in pairs:
+            if i >= self.C.shape[0] or j >= self.C.shape[0]:
+                continue
+            # 合并向量和/计数
+            Sij = self.S[i] + self.S[j]
+            nij = self.n[i] + self.n[j]
+            # 替换 i，删除 j
+            self.S[i] = Sij; self.n[i] = nij
+            self.S = np.delete(self.S, j, axis=0)
+            self.n = np.delete(self.n, j, axis=0)
+            # 同步删除 C/R/sig/kappa/pi
+            self.C = np.delete(self.C, j, axis=0)
+            if self.R is not None:   self.R = np.delete(self.R, j, axis=0)
+            if self.sig is not None: self.sig = np.delete(self.sig, j, axis=0)
+            if self.kappa is not None: self.kappa = np.delete(self.kappa, j, axis=0)
+            if self.pi is not None:    self.pi = np.delete(self.pi, j, axis=0)
+            merged += 1
+            if merged >= max_pairs:
+                break
+        self._recompute_mu_kappa_pi()
+
+
+    # ---- 2) finetune 映射（Update/Expand/Add）----
+    def map_finetune(self, finetune_ds, pool_min=200, bic_gain=1e4):
+        """
+        概率化路由：
+          - update：高置信直接并入簇统计（S,n）
+          - expand：边界样本半权重并入 + 记录软路由 (k1,k2,w1,w2)
+          - add：进入候选池，池子“成型”再用 BIC/ΔNLL 决定是否新建
+        返回：
+          - buckets: {k: [indices]}  每簇硬分配样本（主训练用）
+          - soft_pairs: List[(i,k1,k2,w1,w2)]  边界样本软路由（辅助训练）
+        """
+        Xn = encode_prompts_to_vecs(self.model, finetune_ds.examples, self.token2id,
+                                    self.max_len, self.pad_id, self.cls_id, self.device, pbar=True)
+        buckets = defaultdict(list)
+        add_pool = []
+        soft_pairs = []
+
+        for i in range(Xn.shape[0]):
+            x = Xn[i]
+            act, k1, k2, p1, p2 = self._decide_action(x)
+            if act == "update":
+                buckets[k1].append(i)
+                # 高置信样本：全权重并入
+                self.S[k1] += x; self.n[k1] += 1.0
+            elif act == "expand":
+                buckets[k1].append(i)
+                s = p1 + p2 + 1e-8
+                w1, w2 = p1 / s, p2 / s
+                soft_pairs.append((i, k1, k2, float(w1), float(w2)))
+                # 更保守：0.25 权重并入，避免 κ 掉得太狠
+                self.S[k1] += 0.25 * x;
+                self.n[k1] += 0.25
+            else:
+                # add：进入候选池，但也先放到最近簇训练，避免“丢样本”
+                add_pool.append(i)
+                buckets[k1].append(i)
+                # 训练里弱化它的影响（soft_pairs 给个小权重）
+                soft_pairs.append((i, k1, k2, 0.3, 0.0))
+
+        # 并入后的统计重算 μ,κ,π
+        self._recompute_mu_kappa_pi()
+
+        # 候选池 -> 试建新簇（质量+数量触发）
+        if len(add_pool) >= pool_min:
+            Xp = Xn[add_pool]
+            centers = self._propose_new_clusters(Xp, max_new=2)
+            if self._accept_new_clusters(Xp, centers, bic_gain=bic_gain):
+                for mu_new in centers:
+                    # 以一个最小 S,n 初始化新簇（可以更保守）
+                    self.S = np.vstack([self.S, mu_new[None, :]])
+                    self.n = np.append(self.n, 1.0)
+                self._recompute_mu_kappa_pi()
+                new_start = self.C.shape[0] - len(centers)
+                # 把 add_pool 全部分配给最相近的新簇（简单起步）
+                sims = Xp @ np.stack(centers, 0).T
+                assign = np.argmax(sims, axis=1)
+                for j, idx in enumerate(add_pool):
+                    buckets[new_start + int(assign[j])].append(idx)
+                add_pool.clear()
+
+        # 轻量的合并治理（可选）
+        self._maybe_merge_by_bic(angle_thr=np.deg2rad(12), max_pairs=1)
+
+        # 保存
+        np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
+                 centroids=self.C, radii=self.R, sig=self.sig,
+                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
+
+        return buckets, soft_pairs
+
+
+    # ---- 3) 区域化 LoRA 训练 ----
+    def _ensure_adapter(self, adapter_name: str):
+        if adapter_name not in getattr(self.model, "peft_config", {}):
+            self.model.add_adapter(adapter_name, self.lora_cfg)
+
+    def train_regions(self, finetune_ds: Dataset, finetune_collator,
+                      optimizer_ctor, scheduler_ctor,
+                      epochs_per_region=2, batch_size=256, orig_mix_ratio=1, seed=42,
+                      region_buckets: Dict[int, List[int]] = None,
+                      soft_pairs: Optional[List[Tuple[int,int,int,float,float]]] = None,
+                      soft_rep_factor: int = 3):
+        assert region_buckets is not None
+        soft_pairs = soft_pairs or []
+
+        # 为每个 region 预聚合它的软样本索引（按权重重复）
+        soft_idx_by_k = defaultdict(list)
+        for (i, k1, k2, w1, w2) in soft_pairs:
+            if w1 > 0:
+                soft_idx_by_k[k1].extend([i] * max(0, int(round(w1 * soft_rep_factor))))
+            if w2 > 0:
+                soft_idx_by_k[k2].extend([i] * max(0, int(round(w2 * soft_rep_factor))))
+
+        for k, idx_list in sorted(region_buckets.items(), key=lambda kv: -len(kv[1])):
+            if len(idx_list) == 0:
+                continue
+            name = f"region_{k}"
+            self._ensure_adapter(name)
+            self.model.set_adapter(name)
+            if hasattr(self.model, "train_adapter"):
+                self.model.train_adapter(name)
+            self.model.train()
+
+            # 该簇硬分配样本
+            ft_subset = Subset(finetune_ds, idx_list)
+
+            # 混入 original 同簇样本（稳定器）
+            if (k in self.orig_idx_by_k) and (orig_mix_ratio > 0) and (self.original_ds is not None):
+                orig_idx = self.orig_idx_by_k[k]
+                n_ft = len(ft_subset)
+                n_orig = int(round(n_ft * orig_mix_ratio / max(1e-8, 1.0 - orig_mix_ratio)))
+                if n_orig > 0 and len(orig_idx) > 0:
+                    rng = np.random.RandomState(seed)
+                    sel = rng.choice(orig_idx, size=min(n_orig, len(orig_idx)), replace=False)
+                    orig_subset = Subset(self.original_ds, sel)
+                    base_ds = ConcatDataset([ft_subset, orig_subset])
+                else:
+                    base_ds = ft_subset
+            else:
+                base_ds = ft_subset
+
+            # 软样本重复采样（边界样本）
+            if len(soft_idx_by_k[k]) > 0:
+                soft_subset = Subset(finetune_ds, soft_idx_by_k[k])
+                train_ds = ConcatDataset([base_ds, soft_subset])
+            else:
+                train_ds = base_ds
+
+            dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+                            collate_fn=finetune_collator)
+            optim = optimizer_ctor(self.model)
+            sched = scheduler_ctor(optim, len(dl), epochs_per_region)
+
+            for ep in range(epochs_per_region):
+                pbar = tqdm(dl, desc=f"[RAIE] Region {k} Ep {ep+1}/{epochs_per_region}")
+                for batch in pbar:
+                    input_ids = batch['input_ids'].to(self.device)
+                    attn = batch['attention_mask'].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    out = self.model(input_ids=input_ids, attention_mask=attn)
+                    logits = out.logits
+                    final_pos = attn.sum(dim=1) - 1
+                    rows = torch.arange(input_ids.size(0), device=self.device)
+                    logits_final = logits[rows, final_pos, :]
+
+                    V = logits_final.size(-1)
+                    mask = torch.full((V,), float('-inf'), device=self.device)
+                    mask[self.item_token_ids] = 0.0
+                    logits_final = logits_final + mask
+                    loss = torch.nn.functional.cross_entropy(logits_final, labels)
+
+                    optim.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optim.step(); sched.step()
+                    pbar.set_postfix({"loss": float(loss.detach().cpu())})
+
+            # 保存该区域 LoRA
+            save_dir = os.path.join(self.out_dir, f"adapter_region_{k}")
+            os.makedirs(save_dir, exist_ok=True)
+            self.model.save_pretrained(save_dir, selected_adapters=[name])
+
+
+    # ---- 4) 路由测试（Top-1 激活）----
+    @torch.no_grad()
+    def route_and_eval(self, test_ds: Dataset, eval_collator, candidate_item_ids: List[int],
+                       compute_metrics_fn, k_list=(5,10,20), batch_size=256):
+        # 先对 test prompt 向量化并路由
+        if hasattr(self.model, "set_adapter"):
+            try:
+                self.model.set_adapter("default")
+            except:
+                pass
+        X = encode_prompts_to_vecs(self.model, test_ds.examples, self.token2id,
+                                   self.max_len, self.pad_id, self.cls_id, self.device, pbar=True)
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        route_k = np.argmax(scores, axis=1)
+
+        # 分桶评测
+        from collections import defaultdict
+        idx_by_k = defaultdict(list)
+        for i, k in enumerate(route_k): idx_by_k[int(k)].append(i)
+
+        all_stats = []
+        for k in sorted(idx_by_k.keys()):
+            name = f"region_{k}"
+            # 如未加载过该适配器，尝试从磁盘加载
+            adapter_dir = os.path.join(self.out_dir, f"adapter_region_{k}", f"{name}")
+            if os.path.isdir(adapter_dir) and (name not in getattr(self.model, "peft_config", {})):
+                self.model.load_adapter(adapter_dir, adapter_name=name, is_trainable=False)
+            self.model.set_adapter(name if name in getattr(self.model, "peft_config", {}) else "default")
+
+            sub = Subset(test_ds, idx_by_k[k])
+            dl = DataLoader(sub, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=eval_collator)
+            stat = compute_metrics_fn(self.model, dl, self.device, candidate_item_ids, k_list)
+            stat["cluster_id"] = int(k); stat["num_samples"] = len(sub)
+            all_stats.append(stat)
+        return all_stats
+
+    # 仅为类型占位（若真要混入 original，请把 original_ds 传给 __init__ 并保存在 self）
+    def _wrap_examples(self, idx_by_k, finetune_ds):
+        class _Tmp(Dataset):
+            def __init__(self, ex): self.examples = ex
+            def __len__(self): return len(self.examples)
+            def __getitem__(self, i): return self.examples[i]
+        return _Tmp(finetune_ds.examples)
+
+# ------------------------------
+# Main
+# ------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/',
+                        help='Directory containing original.jsonl, test.jsonl, item_ids.json, meta.json')
+    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_ml10M100K')
+
+    # Sequence / vocab
+    parser.add_argument('--max_len', type=int, default=20, help='Length of prompt (without [CLS])')
+
+    # Model (scale as needed)
+    parser.add_argument('--hidden_size', type=int, default=256)
+    parser.add_argument('--num_hidden_layers', type=int, default=4)
+    parser.add_argument('--num_attention_heads', type=int, default=4)
+    parser.add_argument('--intermediate_size', type=int, default=1024)
+    parser.add_argument('--dropout', type=float, default=0.1)
+
+    # Objective
+    parser.add_argument('--objective', type=str, default='cloze', choices=['cloze', 'next'],
+                        help='cloze = original BERT4Rec training; next = only final position loss')
+    parser.add_argument('--mask_prob', type=float, default=0.15, help='Mask ratio for cloze training')
+
+    # Train
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--warmup_ratio', type=float, default=0.1)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--seed', type=int, default=42)
+
+    # (Optional) prompt masking for 'next' objective only
+    parser.add_argument('--finetune_epochs', type=int, default=2)
+    parser.add_argument('--finetune_batch_size', type=int, default=256)
+    parser.add_argument('--finetune_lr', type=float, default=5e-4)
+    parser.add_argument('--do_prompt_mask', action='store_true')
+    parser.add_argument('--prompt_mask_prob', type=float, default=0.15)
+    parser.add_argument('--orig_mix_ratio', type=float, default=0.3)
+    # Eval
+    parser.add_argument('--topk', type=str, default='5,10,20')
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    set_seed(args.seed)
+
+    # Vocab
+    token2id, id2token, item_token_ids = load_item_vocab(args.data_dir)
+    pad_id = token2id['[PAD]']
+    cls_id = token2id['[CLS]']
+    mask_id = token2id['[MASK]']
+
+    # Datasets
+    train_path = os.path.join(args.data_dir, 'original_stream.jsonl')
+    original_path = os.path.join(args.data_dir, 'original_stride1.jsonl')
+    finetune_path = os.path.join(args.data_dir, 'finetune.jsonl')
+    test_path = os.path.join(args.data_dir, 'test.jsonl')
+    if not (os.path.exists(train_path) and os.path.exists(test_path)):
+        raise FileNotFoundError('Missing original.jsonl or test.jsonl in data_dir')
+
+    train_ds = StreamDataset(train_path)
+    original_ds = NextItemDataset(original_path)
+    finetune_ds = NextItemDataset(finetune_path)
+    test_ds = NextItemDataset(test_path)
+
+    # Collators & loaders
+    if args.objective == 'cloze':
+        train_collator = ClozeTrainCollator(token2id, args.max_len, pad_id, mask_id, cls_id, args.mask_prob)
+    FT_collator = EvalCollator(token2id, args.max_len, mask_id, cls_id, pad_id)
+    eval_collator = EvalCollator(token2id, args.max_len, mask_id, cls_id, pad_id)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2,
+                              collate_fn=train_collator)
+    # test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2,
+    #                          collate_fn=eval_collator)
+
+    # Model config
+    vocab_size = len(id2token)
+    # For cloze, seq = [CLS] + (max_len + 1); for eval, seq = [CLS] + max_len + [MASK]
+    max_position_embeddings = args.max_len + 2
+    config = BertConfig(
+        vocab_size=vocab_size,
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        intermediate_size=args.intermediate_size,
+        max_position_embeddings=max_position_embeddings,
+        hidden_dropout_prob=args.dropout,
+        attention_probs_dropout_prob=args.dropout,
+        pad_token_id=pad_id,
+    )
+    model = BertForMaskedLM(config)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    # Optimizer & Scheduler
+    no_decay = ['bias', 'LayerNorm.weight']
+    params = [
+        {
+            'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': args.weight_decay,
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
+
+    total_steps = len(train_loader) * max(args.epochs, 1)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps,
+                                                num_training_steps=total_steps)
+
+    # Train loop
+    for epoch in range(1, args.epochs + 1):
+        tr = train_one_epoch(model, train_loader, optimizer, scheduler, device,
+                             item_token_ids, objective=args.objective, grad_clip=args.grad_clip)
+        print(f"[Epoch {epoch}] train_loss = {tr['train_loss']:.4f}")
+
+    lora_cfg = LoraConfig(
+        r=8, lora_alpha=16, lora_dropout=0.05,
+        bias="none", task_type=TaskType.FEATURE_EXTRACTION,
+        target_modules=["query", "key", "value","intermediate.dense","output.dense","attention.output.dense"]
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.set_adapter("default")
+    model.to(device)
+
+    ft_params = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+         'weight_decay': 0.0},
+    ]
+    FT_loader = DataLoader(finetune_ds, batch_size=args.finetune_batch_size, shuffle=True, collate_fn=FT_collator)
+    ft_optim = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
+    ft_steps = len(FT_loader) * max(args.finetune_epochs, 1)
+    ft_warm = int(ft_steps * args.warmup_ratio)
+    ft_sched = get_linear_schedule_with_warmup(ft_optim, num_warmup_steps=ft_warm, num_training_steps=ft_steps)
+
+    # 可直接调用你第二段的 finetune_one_epoch_bert，传入插件参数（replay/ewc/lwf）
+    for ep in range(args.finetune_epochs):
+        ft_loss = finetune_one_epoch_bert(
+            model, FT_loader, ft_optim, ft_sched, device, item_token_ids,
+            grad_clip=args.grad_clip,
+        )
+
+
+    bank = RegionBank(
+        model=model,
+        token2id=token2id,
+        item_token_ids=item_token_ids,
+        pad_id=pad_id, cls_id=cls_id,
+        max_len=args.max_len,
+        device=device,
+        out_dir=args.output_dir,
+        K=3, q=0.9, T_low=0.7, T_high=0.9, tau=0.05, gamma=0.5, gap_thr=0.02,
+        lora_r=8, lora_alpha=16, lora_dropout=0.05, target_modules=("query", "key", "value","intermediate.dense","output.dense","attention.output.dense"),
+        original_ds=original_ds
+    )
+    _ = bank.fit_regions_on_original(original_ds)
+
+    region_buckets, soft_pairs = bank.map_finetune(finetune_ds, pool_min=120)
+
+
+    def _optim_ctor(m):
+        no_decay = ['bias', 'LayerNorm.weight']
+        groups = [
+            {'params': [p for n, p in m.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
+             'weight_decay': args.weight_decay},
+            {'params': [p for n, p in m.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
+             'weight_decay': 0.0}
+        ]
+        return torch.optim.AdamW(groups, lr=args.finetune_lr)
+
+    def _sched_ctor(optim, steps_per_epoch, epochs):
+        total = steps_per_epoch * epochs
+        warm = int(total * args.warmup_ratio)
+        return get_linear_schedule_with_warmup(optim, num_warmup_steps=warm, num_training_steps=total)
+
+    bank.train_regions(
+        finetune_ds=finetune_ds,
+        finetune_collator=FT_collator,
+        optimizer_ctor=_optim_ctor,
+        scheduler_ctor=_sched_ctor,
+        epochs_per_region=args.finetune_epochs,
+        batch_size=args.finetune_batch_size,
+        orig_mix_ratio=args.orig_mix_ratio,
+        region_buckets=region_buckets,
+        soft_pairs=soft_pairs,
+        soft_rep_factor=2
+    )
+
+    def _eval_fn(peft_model, loader, device, item_token_ids, topk):
+        # 复用您现有 evaluate() 的主体，但把数据从 loader 取；这里给最小实现
+        peft_model.eval()
+        sum_hit = {K: 0.0 for K in topk};
+        sum_dcg = {K: 0.0 for K in topk};
+        N = 0
+        with torch.no_grad():
+            for batch in loader:
+                inp = batch['input_ids'].to(device);
+                attn = batch['attention_mask'].to(device);
+                lab = batch['labels'].to(device)
+                out = peft_model(input_ids=inp, attention_mask=attn);
+                logits = out.logits
+                rows = torch.arange(inp.size(0), device=device);
+                pos = attn.sum(1) - 1
+                logits_final = logits[rows, pos, :]
+                V = logits_final.size(-1);
+                mask = torch.full((V,), float('-inf'), device=device)
+                mask[item_token_ids] = 0.0;
+                logits_final = logits_final + mask
+
+                max_k = max(topk);
+                _, topk_idx = torch.topk(logits_final, k=max_k, dim=1)
+                labels_exp = lab.view(-1, 1).expand(-1, max_k)
+                match = (topk_idx == labels_exp).float()
+                for K in topk:
+                    mK = match[:, :K];
+                    hit = mK.max(1).values;
+                    posK = torch.argmax(mK, 1)
+                    dcg = hit * (1.0 / torch.log2(posK.float() + 2.0))
+                    sum_hit[K] += float(hit.sum().item());
+                    sum_dcg[K] += float(dcg.sum().item())
+                N += inp.size(0)
+        return {f"Recall@{K}": sum_hit[K] / max(1, N) for K in topk} | {f"NDCG@{K}": sum_dcg[K] / max(1, N) for K in topk}
+
+    stats = bank.route_and_eval(test_ds, eval_collator, item_token_ids, _eval_fn,
+                                k_list=tuple(int(x) for x in args.topk.split(',')))
+    df = pd.DataFrame(stats)
+    w = df["num_samples"];
+    W = max(1, w.sum())
+    global_metrics = {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
+    print("[RAIE][Global]", global_metrics)
+    with open(os.path.join(args.output_dir, "raie_test_global.json"), "w", encoding="utf-8") as f:
+        json.dump(global_metrics, f, ensure_ascii=False, indent=2)
+
+if __name__ == '__main__':
+    main()
