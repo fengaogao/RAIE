@@ -1,0 +1,7 @@
+--- a/train_eval_all_methods.py
++++ b/train_eval_all_methods.py
+@@
+-ap.add_argument('--stage', type=str, choices=['pre','lora','replay','raie'], default='raie',
+-                help='选择运行阶段')
++ap.add_argument('--stage', type=str, choices=['all','pre','lora','replay','raie'], default='raie',
++                help='选择运行阶段')
