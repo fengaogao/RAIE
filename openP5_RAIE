@@ -364,6 +364,7 @@ class SeqRecDatasetFromPairs(Dataset):
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "labels": torch.tensor(lab, dtype=torch.long),
                 "target_item_idx": torch.tensor(idx_tgt, dtype=torch.long),
+                "history_item_idx": torch.tensor(idx_ctx, dtype=torch.long),
             })
 
     def __len__(self): return len(self.examples)
@@ -693,7 +694,6 @@ class RegionBank:
         self.kappa = None; self.pi = None
         self.C0 = None
         self.K = K; self.q = q
-        self.beta_post = 8.0
         self.delta_min = 0.05
         self.T_low = T_low; self.T_high = T_high
         self.tau = tau; self.gamma = gamma; self.gap_thr = gap_thr
@@ -702,6 +702,9 @@ class RegionBank:
 
         self.C = None; self.R = None; self.sig = None
         self.orig_idx_by_k = {}
+        self.pref_proto = None
+        self.pref_counts = None
+        self._item_vec_cache: Dict[int, np.ndarray] = {}
 
         self.lora_cfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
@@ -760,29 +763,118 @@ class RegionBank:
         self.pi = pi_new
         self.C = C_new
 
-    def _scores_post(self, x: np.ndarray):
-        sims = self.C @ x  # [K]
-        scores = np.log(np.clip(self.pi, 1e-8, None)) + self.kappa * sims
-        top2 = np.argsort(scores)[-2:]
-        k2, k1 = int(top2[0]), int(top2[1])
-        s1, s2 = float(scores[k1]), float(scores[k2])
-        z = scores - scores.max()
-        p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
-        return k1, k2, s1, s2, float(p[k1]), float(p[k2])
+    def _ensure_pref_proto_shape(self):
+        if self.C is None:
+            return
+        dim = self.C.shape[1]
+        if self.pref_proto is None:
+            self.pref_proto = np.zeros((self.C.shape[0], dim), np.float32)
+            self.pref_counts = np.zeros((self.C.shape[0],), np.float32)
+            return
+        if self.pref_proto.shape[0] < self.C.shape[0]:
+            extra = np.zeros((self.C.shape[0] - self.pref_proto.shape[0], dim), np.float32)
+            extra_c = np.zeros((self.C.shape[0] - self.pref_counts.shape[0],), np.float32)
+            self.pref_proto = np.vstack([self.pref_proto, extra])
+            self.pref_counts = np.concatenate([self.pref_counts, extra_c])
+        elif self.pref_proto.shape[0] > self.C.shape[0]:
+            self.pref_proto = self.pref_proto[:self.C.shape[0]]
+            self.pref_counts = self.pref_counts[:self.C.shape[0]]
+
+    def _get_item_vec(self, item_idx: int) -> np.ndarray:
+        item_idx = int(item_idx)
+        if item_idx in self._item_vec_cache:
+            return self._item_vec_cache[item_idx]
+        token_id = int(self.item_final_token_ids[item_idx])
+        with torch.no_grad():
+            Ein = self.model.get_input_embeddings().weight
+            vec = Ein[token_id].detach().to("cpu").float().numpy()
+        norm = np.linalg.norm(vec) + 1e-12
+        vec = (vec / norm).astype(np.float32)
+        self._item_vec_cache[item_idx] = vec
+        return vec
+
+    def _history_vector_from_tensor(self, hist_tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+        if hist_tensor is None:
+            return None
+        arr = hist_tensor.detach().cpu().numpy()
+        if arr.size == 0:
+            return None
+        arr = arr[arr >= 0]
+        if arr.size == 0:
+            return None
+        vecs = [self._get_item_vec(int(i)) for i in arr]
+        if len(vecs) == 0:
+            return None
+        stacked = np.stack(vecs, axis=0)
+        mean_vec = stacked.mean(0, keepdims=True)
+        return l2n(mean_vec).reshape(-1)
+
+    def _history_matrix(self, dataset: Dataset) -> Optional[np.ndarray]:
+        if dataset is None or self.C is None:
+            return None
+        dim = self.C.shape[1]
+        H = np.zeros((len(dataset), dim), np.float32)
+        for i in range(len(dataset)):
+            example = dataset[i]
+            hist_tensor = example.get("history_item_idx") if isinstance(example, dict) else None
+            vec = self._history_vector_from_tensor(hist_tensor)
+            if vec is not None and np.isfinite(vec).all():
+                H[i] = vec.astype(np.float32)
+        return H
+
+    def _update_pref_proto(self, k: int, vec: Optional[np.ndarray], weight: float = 1.0):
+        if vec is None or not np.isfinite(vec).all():
+            return
+        weight = max(float(weight), 0.0)
+        if weight <= 0:
+            return
+        self._ensure_pref_proto_shape()
+        prev = self.pref_proto[k] * self.pref_counts[k]
+        new_total = prev + weight * vec.astype(np.float32)
+        denom = self.pref_counts[k] + weight
+        if denom <= 0:
+            return
+        normed = new_total / (np.linalg.norm(new_total) + 1e-12)
+        self.pref_proto[k] = normed.astype(np.float32)
+        self.pref_counts[k] = denom
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        return 1.0 / (1.0 + math.exp(-float(x)))
+
+    def _mixed_scores(self, x: np.ndarray, h_vec: Optional[np.ndarray]):
+        ctx_scores = self.C @ x  # [K]
+        pref_scores = np.zeros_like(ctx_scores)
+        gamma = float(np.clip(self.gamma, 0.0, 1.0))
+        if h_vec is not None and np.isfinite(h_vec).all() and np.linalg.norm(h_vec) > 1e-8 and self.pref_proto is not None:
+            self._ensure_pref_proto_shape()
+            pref_scores = self.pref_proto @ h_vec
+        total = (1.0 - gamma) * ctx_scores + gamma * pref_scores + np.log(np.clip(self.pi, 1e-8, None))
+        return total, ctx_scores, pref_scores
 
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
         return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
 
-    def _decide_action(self, x: np.ndarray):
-        k1, k2, s1, s2, p1, p2 = self._scores_post(x)
+    def _decide_action(self, x: np.ndarray, h_vec: Optional[np.ndarray]):
+        scores, ctx_scores, pref_scores = self._mixed_scores(x, h_vec)
+        order = np.argsort(scores)
+        if order.size == 0:
+            return ("add", 0, 0, 0.0, 0.0)
+        k1 = int(order[-1])
+        k2 = int(order[-2]) if order.size > 1 else k1
         tau1 = self._tau_assign(k1)
-        if s1 < -1.0 and p1 < tau1 * 0.7:
-            return ("add", k1, k2, p1, p2)
-        if p1 >= tau1 and (p1 - p2) >= self.delta_min:
-            return ("update", k1, k2, p1, p2)
-        if p1 >= tau1:
-            return ("expand", k1, k2, p1, p2)
-        return ("add", k1, k2, p1, p2)
+        ctx_margin = float(ctx_scores[k1] - ctx_scores[k2]) if order.size > 1 else float(ctx_scores[k1])
+        pref_margin = float(pref_scores[k1] - pref_scores[k2]) if order.size > 1 else float(pref_scores[k1])
+        ctx_conf = self._sigmoid(ctx_margin)
+        pref_conf = self._sigmoid(pref_margin)
+        gamma = float(np.clip(self.gamma, 0.0, 1.0))
+        agg_conf = (1.0 - gamma) * ctx_conf + gamma * pref_conf
+        dominance = float(scores[k1] - scores[k2]) if order.size > 1 else float(scores[k1])
+        if (scores[k1] < self.tau) or (agg_conf < self.T_low and dominance < self.delta_min):
+            return ("add", k1, k2, agg_conf, dominance)
+        if agg_conf >= max(self.T_high, tau1) and dominance >= self.delta_min:
+            return ("update", k1, k2, agg_conf, dominance)
+        return ("expand", k1, k2, agg_conf, dominance)
 
     def fit_regions_on_original(self, seed=42):
         if self.original_ds is None or len(self.original_ds) == 0:
@@ -806,8 +898,21 @@ class RegionBank:
         for i, k in enumerate(labels.tolist()):
             self.orig_idx_by_k[int(k)].append(i)
 
+        self._ensure_pref_proto_shape()
+        if self.pref_proto is not None:
+            self.pref_proto[:] = 0
+            self.pref_counts[:] = 0
+            if self.original_ds is not None:
+                for k, idxs in self.orig_idx_by_k.items():
+                    for idx in idxs:
+                        example = self.original_ds[idx]
+                        hist = example.get("history_item_idx") if isinstance(example, dict) else None
+                        vec = self._history_vector_from_tensor(hist)
+                        self._update_pref_proto(k, vec, weight=1.0)
+
         np.savez(os.path.join(self.out_dir, "raie_regions_init.npz"),
-                 centroids=C, radii=R, sig=sig, K=self.C.shape[0], dim=self.C.shape[1])
+                 centroids=C, radii=R, sig=sig, K=self.C.shape[0], dim=self.C.shape[1],
+                 pref_proto=self.pref_proto, pref_counts=self.pref_counts)
         return labels
 
     def _bic_score_vmf(self, X: np.ndarray, mu: np.ndarray):
@@ -837,12 +942,14 @@ class RegionBank:
         gain = bic_parent - (bic_a + bic_b)
         return float(gain), (mu_a, mu_b), (idx_a, idx_b)
 
-    def _propose_new_cluster_from_pool(self, X_all: np.ndarray, add_pool: List[Tuple[int,int]], bic_gain=1e4, seed=42):
+    def _propose_new_cluster_from_pool(self, X_all: np.ndarray, H_all: Optional[np.ndarray],
+                                       add_pool: List[Tuple[int,int]], bic_gain=1e4, seed=42):
         if len(add_pool) == 0:
-            return False
+            return False, {}
 
         used = set()
         changed = False
+        new_assignments = defaultdict(list)
         by_parent: Dict[int, List[int]] = defaultdict(list)
         for idx, k1 in add_pool:
             by_parent[int(k1)].append(int(idx))
@@ -897,15 +1004,35 @@ class RegionBank:
             self._recompute_mu_kappa_pi()
             self.K = int(self.C.shape[0])
 
+            self._ensure_pref_proto_shape()
+            new_k = int(self.C.shape[0] - 1)
+            hist_vec = None
+            if H_all is not None and len(new_idx_global) > 0:
+                hist_sel = H_all[new_idx_global]
+                if hist_sel.ndim == 2 and hist_sel.shape[0] > 0:
+                    valid = np.linalg.norm(hist_sel, axis=1) > 1e-8
+                    if valid.any():
+                        hist_vec = hist_sel[valid].mean(0)
+            if hist_vec is None and len(new_idx_global) > 0:
+                hist_vec = X_all[new_idx_global].mean(0)
+            if hist_vec is not None:
+                hist_vec = l2n(hist_vec.reshape(1, -1)).reshape(-1)
+                self.pref_proto[new_k] = hist_vec.astype(np.float32)
+                self.pref_counts[new_k] = max(1.0, float(len(new_idx_global)))
+            else:
+                self.pref_proto[new_k] = self.C[new_k]
+                self.pref_counts[new_k] = 1.0
+
             for gi in new_idx_global:
                 used.add((gi, parent_k))
+            new_assignments[new_k].extend(new_idx_global)
 
             changed = True
 
         if changed:
             add_pool[:] = [(i, k1) for (i, k1) in add_pool if (i, k1) not in used]
 
-        return changed
+        return changed, new_assignments
 
     def _try_merge_close_clusters(self, angle_thr: float = 0.15):
         if self.C.shape[0] <= 1:
@@ -951,6 +1078,16 @@ class RegionBank:
         self.n = self.n[keep]
         if self.C0 is not None:
             self.C0 = self.C0[keep]
+        if self.pref_proto is not None and self.pref_counts is not None:
+            merged_pref = self.pref_proto[i] * self.pref_counts[i] + self.pref_proto[j] * self.pref_counts[j]
+            if np.linalg.norm(merged_pref) > 1e-8:
+                merged_pref = merged_pref / (np.linalg.norm(merged_pref) + 1e-12)
+                self.pref_proto[i] = merged_pref.astype(np.float32)
+            else:
+                self.pref_proto[i] = self.C[i]
+            self.pref_counts[i] = self.pref_counts[i] + self.pref_counts[j]
+            self.pref_proto = self.pref_proto[keep]
+            self.pref_counts = self.pref_counts[keep]
         new_map = {}
         t = 0
         for k in range(len(keep)):
@@ -964,25 +1101,37 @@ class RegionBank:
     # ---------- Map-&-Finetune ----------
     def map_finetune(self, finetune_ds: Dataset, pool_min=200, bic_gain=1e4):
         Xn = encode_prompts_to_vecs_causallm(self.model, finetune_ds, self.device, self.tok, batch_size=256)
+        Hn = self._history_matrix(finetune_ds)
         buckets = defaultdict(list)
         add_pool = []  # (idx, nearest_k1)
         soft_pairs = []
 
         for i in range(Xn.shape[0]):
             x = Xn[i]
-            act, k1, k2, p1, p2 = self._decide_action(x)
+            h_vec = None
+            if Hn is not None:
+                h_vec = Hn[i]
+                if np.linalg.norm(h_vec) < 1e-8:
+                    h_vec = None
+            act, k1, k2, conf, _ = self._decide_action(x, h_vec)
             if act == "update":
                 buckets[k1].append(i)
                 self.S[k1] += x; self.n[k1] += 1.0
+                self._update_pref_proto(k1, h_vec if h_vec is not None else x)
             elif act == "expand":
                 buckets[k1].append(i)
-                s = p1 + p2 + 1e-8
-                w1, w2 = p1 / s, p2 / s
+                ambiguity = max(1.0 - conf, 0.0)
+                w1 = max(conf, 0.0)
+                w2 = ambiguity
+                total = w1 + w2 + 1e-8
+                w1, w2 = w1 / total, w2 / total
                 soft_pairs.append((i, k1, k2, float(w1), float(w2)))
-                self.S[k1] += 0.25 * x; self.n[k1] += 0.25
+                self.S[k1] += float(max(conf, 0.2)) * x; self.n[k1] += float(max(conf, 0.2))
+                self._update_pref_proto(k1, h_vec if h_vec is not None else x, weight=max(conf, 0.2))
+                if w2 > 0:
+                    self._update_pref_proto(k2, h_vec if h_vec is not None else x, weight=w2)
             else:
                 add_pool.append((i, k1))
-                soft_pairs.append((i, k1, k2, 0.3, 0.0))
 
             if (i+1) % 64 == 0:
                 self._recompute_mu_kappa_pi()
@@ -990,17 +1139,20 @@ class RegionBank:
         self._recompute_mu_kappa_pi()
 
         if len(add_pool) >= pool_min:
-            changed = self._propose_new_cluster_from_pool(Xn, add_pool, bic_gain=bic_gain, seed=42)
+            changed, new_assignments = self._propose_new_cluster_from_pool(Xn, Hn, add_pool, bic_gain=bic_gain, seed=42)
             if changed:
                 _ = self._try_merge_close_clusters(angle_thr=max(self.gap_thr, 0.05))
                 self._recompute_mu_kappa_pi()
+                for nk, idxs in new_assignments.items():
+                    buckets[nk].extend(idxs)
 
         for idx, near_k1 in add_pool:
             buckets[near_k1].append(idx)
 
         np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
                  centroids=self.C, radii=self.R, sig=self.sig,
-                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
+                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n,
+                 pref_proto=self.pref_proto, pref_counts=self.pref_counts)
         return buckets, soft_pairs
 
     def _ensure_adapter(self, adapter_name: str):
@@ -1028,6 +1180,9 @@ class RegionBank:
             if w1 > 0: soft_idx_by_k[k1].extend([i] * max(0, int(round(w1 * soft_rep_factor))))
             if w2 > 0: soft_idx_by_k[k2].extend([i] * max(0, int(round(w2 * soft_rep_factor))))
 
+        def _sample_examples(ds, indices):
+            return [ds[int(ii)] for ii in indices]
+
         all_regions = sorted(set(region_buckets.keys()))
         for k in all_regions:
             idx_list = region_buckets.get(k, [])
@@ -1036,42 +1191,47 @@ class RegionBank:
             name = f"region_{k}"
             self._ensure_adapter(name)
             self.model.set_adapter(name)
-            if hasattr(self.model, "train_adapter"): self.model.train_adapter(name)
+            if hasattr(self.model, "train_adapter"):
+                self.model.train_adapter(name)
             self.model.train()
 
-            ft_subset = Subset(finetune_ds, idx_list)
-            if (k in self.orig_idx_by_k) and (orig_mix_ratio > 0) and (self.original_ds is not None):
-                orig_idx = self.orig_idx_by_k[k]
-                n_ft = len(ft_subset)
-                n_orig = int(round(n_ft * orig_mix_ratio / max(1e-8, 1.0 - orig_mix_ratio)))
-                if n_orig > 0 and len(orig_idx) > 0:
-                    rng = np.random.RandomState(seed)
-                    sel = rng.choice(orig_idx, size=min(n_orig, len(orig_idx)), replace=False)
-                    orig_subset = Subset(self.original_ds, sel)
-                    base_ds = ConcatDataset([ft_subset, orig_subset])
-                else:
-                    base_ds = ft_subset
-            else:
-                base_ds = ft_subset
+            rng = np.random.RandomState(seed + k)
+            orig_idx = self.orig_idx_by_k.get(k, []) if (self.original_ds is not None) else []
+            target_batch = max(1, batch_size)
+            anchor_size = int(round(target_batch * np.clip(orig_mix_ratio, 0.0, 0.9)))
+            primary_capacity = max(1, target_batch - anchor_size)
+            soft_ratio = min(0.5, max(0.0, soft_rep_factor / (soft_rep_factor + 5.0)))
+            soft_size = int(round(primary_capacity * soft_ratio)) if len(soft_idx_by_k[k]) > 0 else 0
+            core_size = max(1, primary_capacity - soft_size)
+            steps_per_epoch = max(1, math.ceil(len(idx_list) / core_size))
 
-            if len(soft_idx_by_k[k]) > 0:
-                soft_subset = Subset(finetune_ds, soft_idx_by_k[k])
-                train_ds = ConcatDataset([base_ds, soft_subset])
-            else:
-                train_ds = base_ds
-
-            dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True)
             optim = optimizer_ctor(self.model)
-            sched = scheduler_ctor(optim, len(dl), epochs_per_region)
+            sched = scheduler_ctor(optim, steps_per_epoch, epochs_per_region)
 
             for ep in range(epochs_per_region):
-                pbar = tqdm(dl, desc=f"[RAIE] Region {k} Ep {ep+1}/{epochs_per_region}")
-                for batch in pbar:
+                perm = rng.permutation(np.array(idx_list, dtype=int))
+                batches = [perm[i:i + core_size].tolist() for i in range(0, len(perm), core_size)]
+                if len(batches) == 0:
+                    batches = [perm.tolist()]
+                pbar = tqdm(batches, desc=f"[RAIE] Region {k} Ep {ep+1}/{epochs_per_region}")
+                for chunk in pbar:
+                    batch_entries = _sample_examples(finetune_ds, chunk)
+                    if soft_size > 0 and len(soft_idx_by_k[k]) > 0:
+                        replace_soft = len(soft_idx_by_k[k]) < soft_size
+                        soft_sel = rng.choice(soft_idx_by_k[k], size=soft_size, replace=replace_soft)
+                        batch_entries.extend(_sample_examples(finetune_ds, soft_sel))
+                    if anchor_size > 0 and len(orig_idx) > 0:
+                        replace_orig = len(orig_idx) < anchor_size
+                        anchor_sel = rng.choice(orig_idx, size=min(anchor_size, len(orig_idx)), replace=replace_orig)
+                        batch_entries.extend(_sample_examples(self.original_ds, anchor_sel))
+
+                    batch = collate_fn(batch_entries)
                     loss, _ = ce_loss_on_items(self.model, batch, self.device, self.item_final_token_ids, fp16=fp16)
                     optim.zero_grad(set_to_none=True)
                     loss.backward()
                     optim.step()
-                    if sched is not None: sched.step()
+                    if sched is not None:
+                        sched.step()
                     pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
             save_dir = os.path.join(self.out_dir, f"adapter_region_{k}")
@@ -1086,8 +1246,14 @@ class RegionBank:
             except: pass
 
         X = encode_prompts_to_vecs_causallm(self.model, test_ds, self.device, self.tok, batch_size=batch_size)
-        sims = X @ self.C.T
-        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        H = self._history_matrix(test_ds)
+        ctx = X @ self.C.T
+        pref = np.zeros_like(ctx)
+        gamma = float(np.clip(self.gamma, 0.0, 1.0))
+        if H is not None and self.pref_proto is not None:
+            self._ensure_pref_proto_shape()
+            pref = H @ self.pref_proto.T
+        scores = (1.0 - gamma) * ctx + gamma * pref + np.log(np.clip(self.pi, 1e-8, None))[None, :]
         route_k = np.argmax(scores, axis=1)
 
         idx_by_k = defaultdict(list)
@@ -1599,6 +1765,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         bank.C = bank.R = bank.sig = bank.kappa = bank.pi = None
         bank.S = bank.n = None
         bank.orig_idx_by_k = {}
+        bank.pref_proto = None
+        bank.pref_counts = None
         region_buckets = None; soft_pairs = None
     if is_distributed:
         dist.barrier()
@@ -1611,6 +1779,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     bank.S = bcast_object(bank.S, src=0)
     bank.n = bcast_object(bank.n, src=0)
     bank.orig_idx_by_k = bcast_object(bank.orig_idx_by_k, src=0)
+    bank.pref_proto = bcast_object(bank.pref_proto, src=0)
+    bank.pref_counts = bcast_object(bank.pref_counts, src=0)
     region_buckets = bcast_object(region_buckets, src=0)
     soft_pairs = bcast_object(soft_pairs, src=0)
 
