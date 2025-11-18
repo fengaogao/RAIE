@@ -1659,7 +1659,7 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
     # 新增：阶段控制
-    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','raie'], default='lora',
+    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','raie'], default='raie',
                     help='选择运行阶段')
     ap.add_argument('--resume_base_dir', type=str, default='',
                     help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
