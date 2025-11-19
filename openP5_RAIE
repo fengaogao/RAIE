@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple, Optional
 from datetime import timedelta
 from collections import defaultdict
 
+# ---------- 关键环境项：避免 tokenizers fork 死锁 & CUDA 内存碎片 ----------
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -188,9 +189,15 @@ def _read_vocab(item_ids_path: str) -> List[int]:
         item_ids = obj
     return [int(x) for x in item_ids]
 
+# ---------- 新增：协同式 item_indexing ----------
 def _build_base_map_collaborative(item_ids: List[int],
                                   train_pairs: Dict[int, List[Tuple[int, int]]]
                                   ) -> Dict[int, int]:
+    """
+    协同式索引：按“训练集中物品出现次数（热度）”降序排序；
+    同热度用“首次出现时间（越早越前）”，再用“原始 item_id”打破平局。
+    仅改变 mid -> 连续 [0..N-1] 的映射顺序，不引入额外 token，兼容后续全部逻辑。
+    """
     pop: Dict[int, int] = defaultdict(int)
     first_ts: Dict[int, int] = {}
     for pairs in train_pairs.values():
@@ -198,6 +205,7 @@ def _build_base_map_collaborative(item_ids: List[int],
             pop[m] += 1
             if m not in first_ts:
                 first_ts[m] = ts
+    # 缺失（只在 test 中出现）的物品，热度=0、时间=+inf
     big_ts = 1 << 62
     def sort_key(m):
         return (-pop.get(m, 0), first_ts.get(m, big_ts), m)
@@ -217,6 +225,7 @@ def _build_base_map(item_ids: List[int],
     if method == "collaborative":
         return _build_base_map_collaborative(item_ids, train_pairs)
 
+    # sequential：按训练集中首次出现时间
     first_ts: Dict[int, int] = {}
     for pairs in train_pairs.values():
         for m, ts in pairs:
@@ -364,7 +373,6 @@ class SeqRecDatasetFromPairs(Dataset):
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "labels": torch.tensor(lab, dtype=torch.long),
                 "target_item_idx": torch.tensor(idx_tgt, dtype=torch.long),
-                "history_item_idx": torch.tensor(idx_ctx, dtype=torch.long),
             })
 
     def __len__(self): return len(self.examples)
@@ -484,6 +492,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
         total += float(loss.item())
     return total / max(1, len(dataloader))
 
+# ------------------------------
+# LoRA F 段插件：Replay
+# ------------------------------
 class ReplayBuffer:
     def __init__(self, dataset: Dataset, collate_fn, batch_size: int, sampler=None):
         self.sampler = sampler
@@ -626,6 +637,10 @@ def finetune_one_epoch_causal_anchor(
     E0=None, tune_token_ids: Optional[torch.Tensor]=None, lambda_anchor: float=0.0, fp16=False,
     embed_model=None
 ):
+    """
+    DDP 安全的 anchor 微调：前向/反传在 model（可为 DDP wrapper）；
+    嵌入正则/Hook 在 embed_model（unwrap 后模块）上做。
+    """
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
     total, nstep = 0.0, 0
@@ -676,6 +691,9 @@ def save_clean_base_with_new_tokens(peft_wrapped, tokenizer, out_dir, orig_base_
     base_clean.save_pretrained(out_dir, safe_serialization=True)
     tokenizer.save_pretrained(out_dir)
 
+# =========================================================
+# ================ RAIE: RegionBank（此处开始有改动） ======
+# =========================================================
 class RegionBank:
     def __init__(self, model, tok: AutoTokenizer, item_final_token_ids: List[int],
                  original_ds: Optional[Dataset],
@@ -694,6 +712,7 @@ class RegionBank:
         self.kappa = None; self.pi = None
         self.C0 = None
         self.K = K; self.q = q
+        self.beta_post = 8.0
         self.delta_min = 0.05
         self.T_low = T_low; self.T_high = T_high
         self.tau = tau; self.gamma = gamma; self.gap_thr = gap_thr
@@ -702,9 +721,6 @@ class RegionBank:
 
         self.C = None; self.R = None; self.sig = None
         self.orig_idx_by_k = {}
-        self.pref_proto = None
-        self.pref_counts = None
-        self._item_vec_cache: Dict[int, np.ndarray] = {}
 
         self.lora_cfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
@@ -712,6 +728,7 @@ class RegionBank:
             target_modules=list(target_modules)
         )
 
+    # ---------- 工具：统计形状同步（支持动态增删 K） ----------
     def _sync_priors_shape(self):
         K, H = self.S.shape
         if self.C0 is None:
@@ -732,6 +749,7 @@ class RegionBank:
         elif self.C0.shape[0] > K:
             self.C0 = self.C0[:K, :]
 
+    # ---------- 由充分统计重估 μ, κ, π ----------
     def _recompute_mu_kappa_pi(self):
         eps = 1e-12
         self._sync_priors_shape()
@@ -763,119 +781,32 @@ class RegionBank:
         self.pi = pi_new
         self.C = C_new
 
-    def _ensure_pref_proto_shape(self):
-        if self.C is None:
-            return
-        dim = self.C.shape[1]
-        if self.pref_proto is None:
-            self.pref_proto = np.zeros((self.C.shape[0], dim), np.float32)
-            self.pref_counts = np.zeros((self.C.shape[0],), np.float32)
-            return
-        if self.pref_proto.shape[0] < self.C.shape[0]:
-            extra = np.zeros((self.C.shape[0] - self.pref_proto.shape[0], dim), np.float32)
-            extra_c = np.zeros((self.C.shape[0] - self.pref_counts.shape[0],), np.float32)
-            self.pref_proto = np.vstack([self.pref_proto, extra])
-            self.pref_counts = np.concatenate([self.pref_counts, extra_c])
-        elif self.pref_proto.shape[0] > self.C.shape[0]:
-            self.pref_proto = self.pref_proto[:self.C.shape[0]]
-            self.pref_counts = self.pref_counts[:self.C.shape[0]]
-
-    def _get_item_vec(self, item_idx: int) -> np.ndarray:
-        item_idx = int(item_idx)
-        if item_idx in self._item_vec_cache:
-            return self._item_vec_cache[item_idx]
-        token_id = int(self.item_final_token_ids[item_idx])
-        with torch.no_grad():
-            Ein = self.model.get_input_embeddings().weight
-            vec = Ein[token_id].detach().to("cpu").float().numpy()
-        norm = np.linalg.norm(vec) + 1e-12
-        vec = (vec / norm).astype(np.float32)
-        self._item_vec_cache[item_idx] = vec
-        return vec
-
-    def _history_vector_from_tensor(self, hist_tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
-        if hist_tensor is None:
-            return None
-        arr = hist_tensor.detach().cpu().numpy()
-        if arr.size == 0:
-            return None
-        arr = arr[arr >= 0]
-        if arr.size == 0:
-            return None
-        vecs = [self._get_item_vec(int(i)) for i in arr]
-        if len(vecs) == 0:
-            return None
-        stacked = np.stack(vecs, axis=0)
-        mean_vec = stacked.mean(0, keepdims=True)
-        return l2n(mean_vec).reshape(-1)
-
-    def _history_matrix(self, dataset: Dataset) -> Optional[np.ndarray]:
-        if dataset is None or self.C is None:
-            return None
-        dim = self.C.shape[1]
-        H = np.zeros((len(dataset), dim), np.float32)
-        for i in range(len(dataset)):
-            example = dataset[i]
-            hist_tensor = example.get("history_item_idx") if isinstance(example, dict) else None
-            vec = self._history_vector_from_tensor(hist_tensor)
-            if vec is not None and np.isfinite(vec).all():
-                H[i] = vec.astype(np.float32)
-        return H
-
-    def _update_pref_proto(self, k: int, vec: Optional[np.ndarray], weight: float = 1.0):
-        if vec is None or not np.isfinite(vec).all():
-            return
-        weight = max(float(weight), 0.0)
-        if weight <= 0:
-            return
-        self._ensure_pref_proto_shape()
-        prev = self.pref_proto[k] * self.pref_counts[k]
-        new_total = prev + weight * vec.astype(np.float32)
-        denom = self.pref_counts[k] + weight
-        if denom <= 0:
-            return
-        normed = new_total / (np.linalg.norm(new_total) + 1e-12)
-        self.pref_proto[k] = normed.astype(np.float32)
-        self.pref_counts[k] = denom
-
-    @staticmethod
-    def _sigmoid(x: float) -> float:
-        return 1.0 / (1.0 + math.exp(-float(x)))
-
-    def _mixed_scores(self, x: np.ndarray, h_vec: Optional[np.ndarray]):
-        ctx_scores = self.C @ x  # [K]
-        pref_scores = np.zeros_like(ctx_scores)
-        gamma = float(np.clip(self.gamma, 0.0, 1.0))
-        if h_vec is not None and np.isfinite(h_vec).all() and np.linalg.norm(h_vec) > 1e-8 and self.pref_proto is not None:
-            self._ensure_pref_proto_shape()
-            pref_scores = self.pref_proto @ h_vec
-        total = (1.0 - gamma) * ctx_scores + gamma * pref_scores + np.log(np.clip(self.pi, 1e-8, None))
-        return total, ctx_scores, pref_scores
+    # ---------- 打分/动作 ----------
+    def _scores_post(self, x: np.ndarray):
+        sims = self.C @ x  # [K]
+        scores = np.log(np.clip(self.pi, 1e-8, None)) + self.kappa * sims
+        top2 = np.argsort(scores)[-2:]
+        k2, k1 = int(top2[0]), int(top2[1])
+        s1, s2 = float(scores[k1]), float(scores[k2])
+        z = scores - scores.max()
+        p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
+        return k1, k2, s1, s2, float(p[k1]), float(p[k2])
 
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
         return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
 
-    def _decide_action(self, x: np.ndarray, h_vec: Optional[np.ndarray]):
-        scores, ctx_scores, pref_scores = self._mixed_scores(x, h_vec)
-        order = np.argsort(scores)
-        if order.size == 0:
-            return ("add", 0, 0, 0.0, 0.0)
-        k1 = int(order[-1])
-        k2 = int(order[-2]) if order.size > 1 else k1
+    def _decide_action(self, x: np.ndarray):
+        k1, k2, s1, s2, p1, p2 = self._scores_post(x)
         tau1 = self._tau_assign(k1)
-        ctx_margin = float(ctx_scores[k1] - ctx_scores[k2]) if order.size > 1 else float(ctx_scores[k1])
-        pref_margin = float(pref_scores[k1] - pref_scores[k2]) if order.size > 1 else float(pref_scores[k1])
-        ctx_conf = self._sigmoid(ctx_margin)
-        pref_conf = self._sigmoid(pref_margin)
-        gamma = float(np.clip(self.gamma, 0.0, 1.0))
-        agg_conf = (1.0 - gamma) * ctx_conf + gamma * pref_conf
-        dominance = float(scores[k1] - scores[k2]) if order.size > 1 else float(scores[k1])
-        if (scores[k1] < self.tau) or (agg_conf < self.T_low and dominance < self.delta_min):
-            return ("add", k1, k2, agg_conf, dominance)
-        if agg_conf >= max(self.T_high, tau1) and dominance >= self.delta_min:
-            return ("update", k1, k2, agg_conf, dominance)
-        return ("expand", k1, k2, agg_conf, dominance)
+        if s1 < -1.0 and p1 < tau1 * 0.7:
+            return ("add", k1, k2, p1, p2)
+        if p1 >= tau1 and (p1 - p2) >= self.delta_min:
+            return ("update", k1, k2, p1, p2)
+        if p1 >= tau1:
+            return ("expand", k1, k2, p1, p2)
+        return ("add", k1, k2, p1, p2)
 
+    # ---------- 初始化（原域拟合） ----------
     def fit_regions_on_original(self, seed=42):
         if self.original_ds is None or len(self.original_ds) == 0:
             raise RuntimeError("[RAIE] original dataset is required.")
@@ -898,24 +829,18 @@ class RegionBank:
         for i, k in enumerate(labels.tolist()):
             self.orig_idx_by_k[int(k)].append(i)
 
-        self._ensure_pref_proto_shape()
-        if self.pref_proto is not None:
-            self.pref_proto[:] = 0
-            self.pref_counts[:] = 0
-            if self.original_ds is not None:
-                for k, idxs in self.orig_idx_by_k.items():
-                    for idx in idxs:
-                        example = self.original_ds[idx]
-                        hist = example.get("history_item_idx") if isinstance(example, dict) else None
-                        vec = self._history_vector_from_tensor(hist)
-                        self._update_pref_proto(k, vec, weight=1.0)
-
         np.savez(os.path.join(self.out_dir, "raie_regions_init.npz"),
-                 centroids=C, radii=R, sig=sig, K=self.C.shape[0], dim=self.C.shape[1],
-                 pref_proto=self.pref_proto, pref_counts=self.pref_counts)
+                 centroids=C, radii=R, sig=sig, K=self.C.shape[0], dim=self.C.shape[1])
         return labels
 
+    # =====================================================
+    # ### [RAIE-CHANGE] 动态 K：BIC 评估 + 新簇提议 + 合并
+    # =====================================================
     def _bic_score_vmf(self, X: np.ndarray, mu: np.ndarray):
+        """
+        近似 vMF BIC：用角距离的方差替代，BIC ~ N*log(sigma^2) + p*log(N)
+        只用于相对比较（split/merge 增益），常数项忽略。
+        """
         if X.shape[0] == 0:
             return 0.0
         dots = np.clip(X @ mu, -1, 1)
@@ -926,8 +851,12 @@ class RegionBank:
         return N * np.log(sig2) + p * np.log(max(N, 2))
 
     def _bic_gain_for_split(self, X: np.ndarray, mu_parent: np.ndarray, seed=42):
+        """
+        对 X 做二分 KMeans（球面），返回：gain, (mu_a, mu_b), (idx_a, idx_b)
+        """
         if X.shape[0] < 4:
             return -np.inf, None, None
+        # 二分
         C2, lab2 = spherical_kmeans(X, K=2, niter=30, seed=seed)
         idx_a = np.where(lab2 == 0)[0]; idx_b = np.where(lab2 == 1)[0]
         if len(idx_a) == 0 or len(idx_b) == 0:
@@ -942,14 +871,21 @@ class RegionBank:
         gain = bic_parent - (bic_a + bic_b)
         return float(gain), (mu_a, mu_b), (idx_a, idx_b)
 
-    def _propose_new_cluster_from_pool(self, X_all: np.ndarray, H_all: Optional[np.ndarray],
-                                       add_pool: List[Tuple[int,int]], bic_gain=1e4, seed=42):
+    def _propose_new_cluster_from_pool(self, X_all: np.ndarray, add_pool: List[Tuple[int,int]], bic_gain=1e4, seed=42):
+        """
+        从 add_pool（元素为 (idx_in_Xn, nearest_k1)）中尝试生成新簇。
+        过程：
+          1) 取池中样本的向量，按其最近簇做 parent 分组。
+          2) 对每个 parent 簇的池样本，计算 split 的 BIC 增益；若增益 >= bic_gain，则新建簇。
+          3) 更新全局 C/R/sig/S/n/kappa/pi（动态扩容）。
+        返回：是否新增了至少一个簇；并清理已消费的 add_pool 元素。
+        """
         if len(add_pool) == 0:
-            return False, {}
+            return False
 
         used = set()
         changed = False
-        new_assignments = defaultdict(list)
+        # 逐 parent 簇聚合
         by_parent: Dict[int, List[int]] = defaultdict(list)
         for idx, k1 in add_pool:
             by_parent[int(k1)].append(int(idx))
@@ -963,17 +899,20 @@ class RegionBank:
             if not np.isfinite(gain):
                 continue
             if gain < bic_gain:
-                continue 
+                continue  # 不足以成立新簇
 
+            # 选择较“偏离”的子簇为新簇（用与 parent 的角距离较大者）
             (mu_a, mu_b) = mubu
             (idx_a, idx_b) = split_idx
             dot_a = float(np.clip(mu_a @ mu_parent, -1, 1))
             dot_b = float(np.clip(mu_b @ mu_parent, -1, 1))
+            # 角度大 -> dot 小
             choose_b = (dot_b < dot_a)
             new_mu = mu_b if choose_b else mu_a
             new_idx_local = idx_b if choose_b else idx_a
             new_idx_global = [idx_list[i] for i in new_idx_local]
 
+            # --- 动态扩容 ---
             K_old, H = self.C.shape
             K_new = K_old + 1
 
@@ -981,6 +920,7 @@ class RegionBank:
             self.R = np.concatenate([self.R, np.array([0.0], np.float32)], axis=0)
             self.sig = np.concatenate([self.sig, np.array([0.0], np.float32)], axis=0)
 
+            # 充分统计（新簇 S,n 初值）
             vec_sum = X_all[new_idx_global].sum(0)
             S_new = vec_sum.astype(np.float32)
             n_new = float(len(new_idx_global))
@@ -994,50 +934,40 @@ class RegionBank:
             else:
                 self.C0 = np.vstack([self.C0, new_mu.reshape(1, -1).astype(np.float32)])
 
+            # 原始索引记录
             self.orig_idx_by_k[int(K_old)] = []
 
+            # 更新半径与方差（只针对新簇）
             dots = np.clip(X_all[new_idx_global] @ self.C[-1], -1, 1)
             ang = np.arccos(dots)
             self.R[-1] = np.quantile(ang, self.q).astype(np.float32)
             self.sig[-1] = ang.std().astype(np.float32)
 
+            # 重估 μ/κ/π
             self._recompute_mu_kappa_pi()
             self.K = int(self.C.shape[0])
 
-            self._ensure_pref_proto_shape()
-            new_k = int(self.C.shape[0] - 1)
-            hist_vec = None
-            if H_all is not None and len(new_idx_global) > 0:
-                hist_sel = H_all[new_idx_global]
-                if hist_sel.ndim == 2 and hist_sel.shape[0] > 0:
-                    valid = np.linalg.norm(hist_sel, axis=1) > 1e-8
-                    if valid.any():
-                        hist_vec = hist_sel[valid].mean(0)
-            if hist_vec is None and len(new_idx_global) > 0:
-                hist_vec = X_all[new_idx_global].mean(0)
-            if hist_vec is not None:
-                hist_vec = l2n(hist_vec.reshape(1, -1)).reshape(-1)
-                self.pref_proto[new_k] = hist_vec.astype(np.float32)
-                self.pref_counts[new_k] = max(1.0, float(len(new_idx_global)))
-            else:
-                self.pref_proto[new_k] = self.C[new_k]
-                self.pref_counts[new_k] = 1.0
-
+            # 这些样本在 add_pool 中已被消费
             for gi in new_idx_global:
                 used.add((gi, parent_k))
-            new_assignments[new_k].extend(new_idx_global)
 
             changed = True
 
+        # 清理 add_pool（未消费的保留用于“并回最近簇”）
         if changed:
             add_pool[:] = [(i, k1) for (i, k1) in add_pool if (i, k1) not in used]
 
-        return changed, new_assignments
+        return changed
 
     def _try_merge_close_clusters(self, angle_thr: float = 0.15):
+        """
+        尝试按“中心角距离 + BIC 增益”合并两个最近的簇。
+        返回：是否发生了合并。
+        """
         if self.C.shape[0] <= 1:
             return False
         K = self.C.shape[0]
+        # 找到最近对
         sims = self.C @ self.C.T
         np.fill_diagonal(sims, -1.0)
         k_flat = np.argmax(sims)
@@ -1047,16 +977,23 @@ class RegionBank:
         cos_ij = float(np.clip(self.C[i] @ self.C[j], -1, 1))
         ang_ij = math.acos(cos_ij)
         if ang_ij > angle_thr:
-            return False
+            return False  # 不够近
 
+        # 估计合并是否更优（BIC）
+        # 构造两个簇各自的“样本合成统计”（用 S,n 近似）
+        # 注意：我们没有逐样本，此处做启发式（与 BERT4Rec 版思路一致：有时只用统计量判断）
+        # 用均向量近似 X 集合来比较 BIC：合并后 r 提升则可能更优
+        # 为稳定：取虚拟样本矩阵时用向量方向叠加——这里直接比较“单簇 BIC 近似”差异
         mu_i = self.C[i]; mu_j = self.C[j]
         ni = max(float(self.n[i]), 1.0); nj = max(float(self.n[j]), 1.0)
+        # 近似 BIC（只作相对比较）
         bic_i = ni * np.log(max(self.sig[i]**2, 1e-12))
         bic_j = nj * np.log(max(self.sig[j]**2, 1e-12))
 
         S_merge = self.S[i] + self.S[j]
         n_merge = ni + nj
         mu_merge = l2n(S_merge.reshape(1, -1)).reshape(-1)
+        # 合并后的近似方差：简单按权平均
         sig_merge = max( (ni*self.sig[i] + nj*self.sig[j]) / max(n_merge,1.0), 1e-6)
         bic_merge = n_merge * np.log(max(sig_merge**2, 1e-12))
 
@@ -1064,12 +1001,15 @@ class RegionBank:
         if gain < 0:
             return False
 
+        # 真正合并（收缩 i/j -> i）
         self.S[i] = S_merge.astype(np.float32)
         self.n[i] = n_merge
         self.C[i] = mu_merge.astype(np.float32)
         self.sig[i] = float(sig_merge)
+        # radius 重新估：用 sig 的分位近似（稳定起见，仍保留旧半径的较大者）
         self.R[i] = float(max(self.R[i], self.R[j]))
 
+        # 删 j
         keep = [k for k in range(self.C.shape[0]) if k != j]
         self.C = self.C[keep]
         self.R = self.R[keep]
@@ -1078,16 +1018,7 @@ class RegionBank:
         self.n = self.n[keep]
         if self.C0 is not None:
             self.C0 = self.C0[keep]
-        if self.pref_proto is not None and self.pref_counts is not None:
-            merged_pref = self.pref_proto[i] * self.pref_counts[i] + self.pref_proto[j] * self.pref_counts[j]
-            if np.linalg.norm(merged_pref) > 1e-8:
-                merged_pref = merged_pref / (np.linalg.norm(merged_pref) + 1e-12)
-                self.pref_proto[i] = merged_pref.astype(np.float32)
-            else:
-                self.pref_proto[i] = self.C[i]
-            self.pref_counts[i] = self.pref_counts[i] + self.pref_counts[j]
-            self.pref_proto = self.pref_proto[keep]
-            self.pref_counts = self.pref_counts[keep]
+        # 重映射 orig_idx_by_k
         new_map = {}
         t = 0
         for k in range(len(keep)):
@@ -1101,60 +1032,52 @@ class RegionBank:
     # ---------- Map-&-Finetune ----------
     def map_finetune(self, finetune_ds: Dataset, pool_min=200, bic_gain=1e4):
         Xn = encode_prompts_to_vecs_causallm(self.model, finetune_ds, self.device, self.tok, batch_size=256)
-        Hn = self._history_matrix(finetune_ds)
         buckets = defaultdict(list)
         add_pool = []  # (idx, nearest_k1)
         soft_pairs = []
 
         for i in range(Xn.shape[0]):
             x = Xn[i]
-            h_vec = None
-            if Hn is not None:
-                h_vec = Hn[i]
-                if np.linalg.norm(h_vec) < 1e-8:
-                    h_vec = None
-            act, k1, k2, conf, _ = self._decide_action(x, h_vec)
+            act, k1, k2, p1, p2 = self._decide_action(x)
             if act == "update":
                 buckets[k1].append(i)
                 self.S[k1] += x; self.n[k1] += 1.0
-                self._update_pref_proto(k1, h_vec if h_vec is not None else x)
             elif act == "expand":
                 buckets[k1].append(i)
-                ambiguity = max(1.0 - conf, 0.0)
-                w1 = max(conf, 0.0)
-                w2 = ambiguity
-                total = w1 + w2 + 1e-8
-                w1, w2 = w1 / total, w2 / total
+                s = p1 + p2 + 1e-8
+                w1, w2 = p1 / s, p2 / s
                 soft_pairs.append((i, k1, k2, float(w1), float(w2)))
-                self.S[k1] += float(max(conf, 0.2)) * x; self.n[k1] += float(max(conf, 0.2))
-                self._update_pref_proto(k1, h_vec if h_vec is not None else x, weight=max(conf, 0.2))
-                if w2 > 0:
-                    self._update_pref_proto(k2, h_vec if h_vec is not None else x, weight=w2)
+                self.S[k1] += 0.25 * x; self.n[k1] += 0.25
             else:
                 add_pool.append((i, k1))
+                soft_pairs.append((i, k1, k2, 0.3, 0.0))
 
+            # 在线轻度更新（与 BERT4Rec 版一致）
             if (i+1) % 64 == 0:
                 self._recompute_mu_kappa_pi()
 
+        # 先重估一次
         self._recompute_mu_kappa_pi()
 
+        # ### [RAIE-CHANGE]：当池够大时，尝试新簇提议 + 可选合并
         if len(add_pool) >= pool_min:
-            changed, new_assignments = self._propose_new_cluster_from_pool(Xn, Hn, add_pool, bic_gain=bic_gain, seed=42)
+            changed = self._propose_new_cluster_from_pool(Xn, add_pool, bic_gain=bic_gain, seed=42)
             if changed:
+                # 可选：做一次最邻近合并（与 BERT4Rec 版的“择优合并”一致）
                 _ = self._try_merge_close_clusters(angle_thr=max(self.gap_thr, 0.05))
+                # 变更后，再重估一次统计
                 self._recompute_mu_kappa_pi()
-                for nk, idxs in new_assignments.items():
-                    buckets[nk].extend(idxs)
 
+        # 对剩余池样本（未触发新簇的）并回最近簇
         for idx, near_k1 in add_pool:
             buckets[near_k1].append(idx)
 
         np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
                  centroids=self.C, radii=self.R, sig=self.sig,
-                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n,
-                 pref_proto=self.pref_proto, pref_counts=self.pref_counts)
+                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
         return buckets, soft_pairs
 
+    # ---------- 适配器准备 ----------
     def _ensure_adapter(self, adapter_name: str):
         if adapter_name not in getattr(self.model, "peft_config", {}):
             dir_anchor = os.path.join(self.out_dir, "default_for_raie")
@@ -1166,6 +1089,7 @@ class RegionBank:
             else:
                 self.model.add_adapter(adapter_name, self.lora_cfg)
 
+    # ---------- 区域训练（覆盖新建 region） ----------
     def train_regions(self, finetune_ds: Dataset, collate_fn,
                       optimizer_ctor, scheduler_ctor,
                       epochs_per_region=2, batch_size=256, orig_mix_ratio=1.0, seed=42,
@@ -1180,9 +1104,6 @@ class RegionBank:
             if w1 > 0: soft_idx_by_k[k1].extend([i] * max(0, int(round(w1 * soft_rep_factor))))
             if w2 > 0: soft_idx_by_k[k2].extend([i] * max(0, int(round(w2 * soft_rep_factor))))
 
-        def _sample_examples(ds, indices):
-            return [ds[int(ii)] for ii in indices]
-
         all_regions = sorted(set(region_buckets.keys()))
         for k in all_regions:
             idx_list = region_buckets.get(k, [])
@@ -1191,47 +1112,42 @@ class RegionBank:
             name = f"region_{k}"
             self._ensure_adapter(name)
             self.model.set_adapter(name)
-            if hasattr(self.model, "train_adapter"):
-                self.model.train_adapter(name)
+            if hasattr(self.model, "train_adapter"): self.model.train_adapter(name)
             self.model.train()
 
-            rng = np.random.RandomState(seed + k)
-            orig_idx = self.orig_idx_by_k.get(k, []) if (self.original_ds is not None) else []
-            target_batch = max(1, batch_size)
-            anchor_size = int(round(target_batch * np.clip(orig_mix_ratio, 0.0, 0.9)))
-            primary_capacity = max(1, target_batch - anchor_size)
-            soft_ratio = min(0.5, max(0.0, soft_rep_factor / (soft_rep_factor + 5.0)))
-            soft_size = int(round(primary_capacity * soft_ratio)) if len(soft_idx_by_k[k]) > 0 else 0
-            core_size = max(1, primary_capacity - soft_size)
-            steps_per_epoch = max(1, math.ceil(len(idx_list) / core_size))
+            ft_subset = Subset(finetune_ds, idx_list)
+            if (k in self.orig_idx_by_k) and (orig_mix_ratio > 0) and (self.original_ds is not None):
+                orig_idx = self.orig_idx_by_k[k]
+                n_ft = len(ft_subset)
+                n_orig = int(round(n_ft * orig_mix_ratio / max(1e-8, 1.0 - orig_mix_ratio)))
+                if n_orig > 0 and len(orig_idx) > 0:
+                    rng = np.random.RandomState(seed)
+                    sel = rng.choice(orig_idx, size=min(n_orig, len(orig_idx)), replace=False)
+                    orig_subset = Subset(self.original_ds, sel)
+                    base_ds = ConcatDataset([ft_subset, orig_subset])
+                else:
+                    base_ds = ft_subset
+            else:
+                base_ds = ft_subset
 
+            if len(soft_idx_by_k[k]) > 0:
+                soft_subset = Subset(finetune_ds, soft_idx_by_k[k])
+                train_ds = ConcatDataset([base_ds, soft_subset])
+            else:
+                train_ds = base_ds
+
+            dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True)
             optim = optimizer_ctor(self.model)
-            sched = scheduler_ctor(optim, steps_per_epoch, epochs_per_region)
+            sched = scheduler_ctor(optim, len(dl), epochs_per_region)
 
             for ep in range(epochs_per_region):
-                perm = rng.permutation(np.array(idx_list, dtype=int))
-                batches = [perm[i:i + core_size].tolist() for i in range(0, len(perm), core_size)]
-                if len(batches) == 0:
-                    batches = [perm.tolist()]
-                pbar = tqdm(batches, desc=f"[RAIE] Region {k} Ep {ep+1}/{epochs_per_region}")
-                for chunk in pbar:
-                    batch_entries = _sample_examples(finetune_ds, chunk)
-                    if soft_size > 0 and len(soft_idx_by_k[k]) > 0:
-                        replace_soft = len(soft_idx_by_k[k]) < soft_size
-                        soft_sel = rng.choice(soft_idx_by_k[k], size=soft_size, replace=replace_soft)
-                        batch_entries.extend(_sample_examples(finetune_ds, soft_sel))
-                    if anchor_size > 0 and len(orig_idx) > 0:
-                        replace_orig = len(orig_idx) < anchor_size
-                        anchor_sel = rng.choice(orig_idx, size=min(anchor_size, len(orig_idx)), replace=replace_orig)
-                        batch_entries.extend(_sample_examples(self.original_ds, anchor_sel))
-
-                    batch = collate_fn(batch_entries)
+                pbar = tqdm(dl, desc=f"[RAIE] Region {k} Ep {ep+1}/{epochs_per_region}")
+                for batch in pbar:
                     loss, _ = ce_loss_on_items(self.model, batch, self.device, self.item_final_token_ids, fp16=fp16)
                     optim.zero_grad(set_to_none=True)
                     loss.backward()
                     optim.step()
-                    if sched is not None:
-                        sched.step()
+                    if sched is not None: sched.step()
                     pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
             save_dir = os.path.join(self.out_dir, f"adapter_region_{k}")
@@ -1246,14 +1162,8 @@ class RegionBank:
             except: pass
 
         X = encode_prompts_to_vecs_causallm(self.model, test_ds, self.device, self.tok, batch_size=batch_size)
-        H = self._history_matrix(test_ds)
-        ctx = X @ self.C.T
-        pref = np.zeros_like(ctx)
-        gamma = float(np.clip(self.gamma, 0.0, 1.0))
-        if H is not None and self.pref_proto is not None:
-            self._ensure_pref_proto_shape()
-            pref = H @ self.pref_proto.T
-        scores = (1.0 - gamma) * ctx + gamma * pref + np.log(np.clip(self.pi, 1e-8, None))[None, :]
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
         route_k = np.argmax(scores, axis=1)
 
         idx_by_k = defaultdict(list)
@@ -1282,6 +1192,9 @@ class RegionBank:
             N += n_sub
         return {k: (v / max(1, N)) for k, v in sums.items()}
 
+# ------------------------------
+# 公共工具：数据与 mid2idx 的保存/读取
+# ------------------------------
 def save_mid2idx(path: str, mid2idx: Dict[int, int]):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -1301,6 +1214,10 @@ def load_mid2idx(path: str) -> Optional[Dict[int, int]]:
         return None
 
 def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
+    """
+    优先从 output_dir/mid2idx.json 读取；否则重建（与原逻辑一致）。
+    返回 mid2idx 与 n_items。
+    """
     mid2idx_path = os.path.join(args.output_dir, "mid2idx.json")
     mid2idx = load_mid2idx(mid2idx_path)
     item_ids = _read_vocab(args.item_ids_path or os.path.join(args.data_dir, "item_ids.json"))
@@ -1310,6 +1227,7 @@ def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
             print(f"[INFO] Loaded mid2idx from {mid2idx_path} (|mid|={len(mid2idx)})")
         return mid2idx, n_items
 
+    # fallback：重建
     if is_main:
         print("[INFO] mid2idx.json not found -> rebuild mapping from training split.")
     _, _, _, n_items2, mid2idx = load_preprocessed_splits(
@@ -1321,6 +1239,7 @@ def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
         item_ids_path=args.item_ids_path or os.path.join(args.data_dir, "item_ids.json"),
         test_jsonl_path=None
     )
+    # 保存一下，供后续阶段直接复用
     if (mid2idx is not None) and (len(mid2idx) > 0):
         if is_main:
             save_mid2idx(mid2idx_path, mid2idx)
@@ -1329,6 +1248,9 @@ def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
     return mid2idx, n_items
 
 def make_datasets_for_stage(args, tok, mid2idx, n_items):
+    """
+    用于各方法阶段的通用数据集构造（不依赖 pre 阶段的模型状态）。
+    """
     final_item_tokens = make_item_final_tokens(n_items)
     item_token_seq = [[t] for t in final_item_tokens]
 
@@ -1353,7 +1275,17 @@ def make_datasets_for_stage(args, tok, mid2idx, n_items):
     ds_F = make_ds(finetune_jsonl_path)
     return ds_trainO, ds_O, ds_T, ds_F, final_item_tokens
 
+# ------------------------------
+# 阶段执行函数
+# ------------------------------
 def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
+    """
+    跑完 LoRA 之前全部内容，输出：
+    - output_dir/default            （O 段 LoRA 适配器）
+    - output_dir/base_with_new_tokens（干净 Base + 新增 tokens）
+    - output_dir/mid2idx.json
+    - 原/测评指标 json
+    """
     # 1) Data / Indexing
     train_seq, val_seq, test_seq, n_items, mid2idx = load_preprocessed_splits(
         data_dir=args.data_dir,
@@ -1403,6 +1335,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     item_final_token_ids: List[int] = [tok.convert_tokens_to_ids(t) for t in final_item_tokens]
 
+    # LoRA 包装（训练 O 段）
     if args.use_lora:
         if not PEFT_AVAILABLE:
             raise RuntimeError(f"PEFT not available: {_PEFT_ERR}")
@@ -1453,6 +1386,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
     ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
 
+    # 优化器（O 段）
     lora_params, emb_params, other_params = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -1473,6 +1407,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     k_list = sorted(set(args.topk))
 
+    # 5) 训练（只训练 O 段，不在每 epoch 评估）
     if is_main:
         print(f"[Train] O-stage epochs={args.epochs}")
     for ep in range(1, args.epochs + 1):
@@ -1498,6 +1433,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         with open(os.path.join(args.output_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
             json.dump(mT, f, ensure_ascii=False, indent=2)
 
+    # 保存 default 适配器 + 生成干净 base（带新 vocab） + mid2idx.json
     if is_main and args.use_lora:
         default_dir = os.path.join(args.output_dir, "default")
         ensure_dir(default_dir)
@@ -1505,6 +1441,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         peft_wrapped.save_pretrained(default_dir, selected_adapters=["default"])
         tok.save_pretrained(default_dir)
 
+    # 生成干净 base
     if is_main and args.use_lora:
         base_dir = os.path.join(args.output_dir, "base_with_new_tokens")
         save_clean_base_with_new_tokens(
@@ -1514,6 +1451,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
             orig_base_path=args.model_name_or_path
         )
         print(f"[SAVE] clean base saved to {base_dir}")
+        # 保存 mid2idx
         save_mid2idx(os.path.join(args.output_dir, "mid2idx.json"), mid2idx)
     try:
         del optimizer, scheduler
@@ -1556,6 +1494,7 @@ def stage_lora(args, device, is_distributed, local_rank, is_main, load_dtype):
     lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
     lora_model.set_adapter("default")
 
+    # 准备数据（基于保存/重建的 mid2idx）
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_lora, mid2idx, n_items)
     pad_id = tok_lora.pad_token_id
@@ -1692,6 +1631,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     )
     raie_model.load_adapter(default_dir, adapter_name="default", is_trainable=True); raie_model.set_adapter("default")
 
+    # Anchor 微调（DDP 包裹，但正则用 unwrap 模块）
     if is_distributed:
         raie_model = torch.nn.parallel.DistributedDataParallel(
             raie_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
@@ -1699,6 +1639,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
     rm = raie_model.module if hasattr(raie_model, "module") else raie_model
 
+    # 数据
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_raie, mid2idx, n_items)
     pad_id = tok_raie.pad_token_id
@@ -1745,11 +1686,13 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
         if is_main: print(f"[RAIE][F-anchor] epoch={ep+1} loss={loss:.4f}")
 
+    # 保存 default（供区域适配器初始化/fallback）
     if is_main:
         default_dir2 = os.path.join(args.output_dir, "default_for_raie")
         ensure_dir(default_dir2)
         rm.save_pretrained(default_dir2, selected_adapters=["default"])
 
+    # 拟合区域 + region 分片训练（仅 rm 非 DDP，用 rm）
     bank = RegionBank(
         model=rm, tok=tok_raie,
         item_final_token_ids=item_final_token_ids,
@@ -1765,9 +1708,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         bank.C = bank.R = bank.sig = bank.kappa = bank.pi = None
         bank.S = bank.n = None
         bank.orig_idx_by_k = {}
-        bank.pref_proto = None
-        bank.pref_counts = None
         region_buckets = None; soft_pairs = None
+    # ==== 在这里加 barrier，确保所有 rank 同步后再去创建/使用 gloo 组 ====
     if is_distributed:
         dist.barrier()
 
@@ -1779,11 +1721,10 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     bank.S = bcast_object(bank.S, src=0)
     bank.n = bcast_object(bank.n, src=0)
     bank.orig_idx_by_k = bcast_object(bank.orig_idx_by_k, src=0)
-    bank.pref_proto = bcast_object(bank.pref_proto, src=0)
-    bank.pref_counts = bcast_object(bank.pref_counts, src=0)
     region_buckets = bcast_object(region_buckets, src=0)
     soft_pairs = bcast_object(soft_pairs, src=0)
 
+    # —— 区域训练仅在 rank0 上进行，避免跨 rank 同步 ——
     if is_main:
         bank.train_regions(
             finetune_ds=ds_F, collate_fn=collate,
@@ -1800,7 +1741,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
 
     if is_distributed:
-        dist.barrier()  
+        dist.barrier()  # 等 rank0 训练并落盘所有 region 适配器
 
     if is_main:
         k_list = sorted(set(args.topk))
@@ -1815,7 +1756,9 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     _free_cuda(raie_model, rm)
     if is_distributed: dist.barrier()
 
-
+# ------------------------------
+# 主流程（新增 --stage 分流）
+# ------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
