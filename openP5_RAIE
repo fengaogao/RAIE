@@ -1,7 +1,7 @@
 import sys
 import os, gc, math, json, random, argparse, re, shutil
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 from datetime import timedelta
 from collections import defaultdict
 
@@ -694,6 +694,19 @@ def save_clean_base_with_new_tokens(peft_wrapped, tokenizer, out_dir, orig_base_
 # =========================================================
 # ================ RAIE: RegionBank（此处开始有改动） ======
 # =========================================================
+
+
+@dataclass
+class EditDecision:
+    action: str
+    primary: int
+    secondary: int
+    weight_primary: float
+    weight_secondary: float
+    confidence_gap: float
+    distance_primary: float
+
+
 class RegionBank:
     def __init__(self, model, tok: AutoTokenizer, item_final_token_ids: List[int],
                  original_ds: Optional[Dataset],
@@ -795,16 +808,32 @@ class RegionBank:
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
         return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
 
-    def _decide_action(self, x: np.ndarray):
+    def _decide_action(self, x: np.ndarray) -> EditDecision:
         k1, k2, s1, s2, p1, p2 = self._scores_post(x)
         tau1 = self._tau_assign(k1)
-        if s1 < -1.0 and p1 < tau1 * 0.7:
-            return ("add", k1, k2, p1, p2)
-        if p1 >= tau1 and (p1 - p2) >= self.delta_min:
-            return ("update", k1, k2, p1, p2)
-        if p1 >= tau1:
-            return ("expand", k1, k2, p1, p2)
-        return ("add", k1, k2, p1, p2)
+        radius = float(self.R[k1]) if self.R is not None else 1.0
+        dot1 = float(np.clip(self.C[k1] @ x, -1, 1))
+        dist1 = math.acos(dot1)
+        in_core = dist1 <= radius * max(1e-6, 1.0 - self.tau)
+        near_boundary = dist1 <= radius * (1.0 + self.tau)
+        gap = float(p1 - p2)
+
+        if (not near_boundary) or (s1 < -1.0 and p1 < tau1 * 0.7):
+            action = "add"
+        elif in_core and gap >= self.delta_min and p1 >= tau1:
+            action = "update"
+        else:
+            action = "expand"
+
+        return EditDecision(
+            action=action,
+            primary=int(k1),
+            secondary=int(k2),
+            weight_primary=float(max(p1, 1e-4)),
+            weight_secondary=float(max(p2, 0.0)),
+            confidence_gap=gap,
+            distance_primary=float(dist1),
+        )
 
     # ---------- 初始化（原域拟合） ----------
     def fit_regions_on_original(self, seed=42):
@@ -1033,24 +1062,36 @@ class RegionBank:
     def map_finetune(self, finetune_ds: Dataset, pool_min=200, bic_gain=1e4):
         Xn = encode_prompts_to_vecs_causallm(self.model, finetune_ds, self.device, self.tok, batch_size=256)
         buckets = defaultdict(list)
+        bucket_weights = defaultdict(list)
         add_pool = []  # (idx, nearest_k1)
         soft_pairs = []
 
         for i in range(Xn.shape[0]):
             x = Xn[i]
-            act, k1, k2, p1, p2 = self._decide_action(x)
-            if act == "update":
+            decision = self._decide_action(x)
+            k1, k2 = decision.primary, decision.secondary
+
+            if decision.action == "update":
+                weight = float(max(decision.confidence_gap, 0.05))
                 buckets[k1].append(i)
-                self.S[k1] += x; self.n[k1] += 1.0
-            elif act == "expand":
+                bucket_weights[k1].append(weight)
+                self.S[k1] += weight * x; self.n[k1] += weight
+            elif decision.action == "expand":
+                w1 = float(max(decision.weight_primary, 1e-4))
+                w2 = float(max(decision.weight_secondary, 0.0))
+                denom = max(w1 + w2, 1e-6)
+                main_w = w1 / denom
+                aux_w = w2 / denom
                 buckets[k1].append(i)
-                s = p1 + p2 + 1e-8
-                w1, w2 = p1 / s, p2 / s
-                soft_pairs.append((i, k1, k2, float(w1), float(w2)))
-                self.S[k1] += 0.25 * x; self.n[k1] += 0.25
+                bucket_weights[k1].append(main_w)
+                if aux_w > 0:
+                    soft_pairs.append((i, k1, k2, float(main_w), float(aux_w)))
+                self.S[k1] += main_w * x; self.n[k1] += main_w
+                if aux_w > 0:
+                    self.S[k2] += aux_w * x; self.n[k2] += aux_w
             else:
                 add_pool.append((i, k1))
-                soft_pairs.append((i, k1, k2, 0.3, 0.0))
+                soft_pairs.append((i, k1, k2, 0.1, 0.0))
 
             # 在线轻度更新（与 BERT4Rec 版一致）
             if (i+1) % 64 == 0:
@@ -1071,11 +1112,12 @@ class RegionBank:
         # 对剩余池样本（未触发新簇的）并回最近簇
         for idx, near_k1 in add_pool:
             buckets[near_k1].append(idx)
+            bucket_weights[near_k1].append(1.0)
 
         np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
                  centroids=self.C, radii=self.R, sig=self.sig,
                  kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
-        return buckets, soft_pairs
+        return buckets, soft_pairs, bucket_weights
 
     # ---------- 适配器准备 ----------
     def _ensure_adapter(self, adapter_name: str):
@@ -1274,6 +1316,74 @@ def make_datasets_for_stage(args, tok, mid2idx, n_items):
     ds_T = make_ds(test_jsonl_path)
     ds_F = make_ds(finetune_jsonl_path)
     return ds_trainO, ds_O, ds_T, ds_F, final_item_tokens
+
+
+@dataclass
+class RaieDataBundle:
+    ds_trainO: Dataset
+    ds_O: Dataset
+    ds_T: Dataset
+    ds_F: Dataset
+    final_item_tokens: List[str]
+    item_final_token_ids: List[int]
+    collate_fn: Callable
+    finetune_loader: DataLoader
+    finetune_sampler: Optional[DistributedSampler]
+
+
+def prepare_raie_data_bundle(args, tok, mid2idx, n_items, is_distributed):
+    ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok, mid2idx, n_items)
+    pad_id = tok.pad_token_id
+    collate = lambda batch: collate_batch(batch, pad_id)
+    item_final_token_ids = [tok.convert_tokens_to_ids(t) for t in final_item_tokens]
+
+    ft_sampler = DistributedSampler(
+        ds_F,
+        num_replicas=(dist.get_world_size() if is_distributed else 1),
+        rank=(dist.get_rank() if is_distributed else 0),
+        shuffle=True,
+    ) if is_distributed else None
+
+    ld_F = DataLoader(
+        ds_F,
+        batch_size=args.finetune_batch_size,
+        shuffle=(ft_sampler is None),
+        sampler=ft_sampler,
+        num_workers=2,
+        pin_memory=True,
+        collate_fn=collate,
+    )
+
+    return RaieDataBundle(
+        ds_trainO=ds_trainO,
+        ds_O=ds_O,
+        ds_T=ds_T,
+        ds_F=ds_F,
+        final_item_tokens=final_item_tokens,
+        item_final_token_ids=item_final_token_ids,
+        collate_fn=collate,
+        finetune_loader=ld_F,
+        finetune_sampler=ft_sampler,
+    )
+
+
+def apply_bucket_weights(region_buckets: Dict[int, List[int]],
+                         bucket_weights: Optional[Dict[int, List[float]]],
+                         rep_factor: float) -> Dict[int, List[int]]:
+    """将 map 阶段的权重转换为重复采样次数。"""
+    if bucket_weights is None or rep_factor <= 1e-3:
+        return region_buckets
+    out = {}
+    for k, idxs in region_buckets.items():
+        weights = bucket_weights.get(k, []) if bucket_weights is not None else []
+        if len(weights) != len(idxs):
+            weights = [1.0] * len(idxs)
+        expanded = []
+        for idx, w in zip(idxs, weights):
+            repeat = max(1, int(round(rep_factor * max(w, 1e-3))))
+            expanded.extend([idx] * repeat)
+        out[k] = expanded
+    return out
 
 # ------------------------------
 # 阶段执行函数
@@ -1639,27 +1749,22 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
     rm = raie_model.module if hasattr(raie_model, "module") else raie_model
 
-    # 数据
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
-    ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_raie, mid2idx, n_items)
-    pad_id = tok_raie.pad_token_id
-    collate = lambda batch: collate_batch(batch, pad_id)
-    item_final_token_ids = [tok_raie.convert_tokens_to_ids(t) for t in final_item_tokens]
-
-    ft_sampler_raie = DistributedSampler(ds_F, num_replicas=(dist.get_world_size() if is_distributed else 1),
-                                         rank=(dist.get_rank() if is_distributed else 0), shuffle=True) if is_distributed else None
-    ld_F_raie = DataLoader(ds_F, batch_size=args.finetune_batch_size,
-                           shuffle=(ft_sampler_raie is None), sampler=ft_sampler_raie,
-                           num_workers=2, pin_memory=True, collate_fn=collate)
+    data_bundle = prepare_raie_data_bundle(args, tok_raie, mid2idx, n_items, is_distributed)
+    collate = data_bundle.collate_fn
+    item_final_token_ids = data_bundle.item_final_token_ids
 
     FT_optim = torch.optim.AdamW([p for p in raie_model.parameters() if p.requires_grad], lr=args.lr)
-    FT_sched = get_linear_schedule_with_warmup(FT_optim, int(args.warmup_ratio*len(ld_F_raie)*max(1,args.finetune_epochs)),
-                                               len(ld_F_raie)*max(1,args.finetune_epochs))
+    FT_sched = get_linear_schedule_with_warmup(
+        FT_optim,
+        int(args.warmup_ratio * len(data_bundle.finetune_loader) * max(1, args.finetune_epochs)),
+        len(data_bundle.finetune_loader) * max(1, args.finetune_epochs)
+    )
 
     Ein = rm.get_input_embeddings()
     E0 = Ein.weight.detach().clone()
     f_item_token_ids = set()
-    for r in ds_F.examples:
+    for r in data_bundle.ds_F.examples:
         tgt_idx = int(r["target_item_idx"].item())
         tid = item_final_token_ids[tgt_idx]
         f_item_token_ids.add(int(tid))
@@ -1675,11 +1780,12 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
             Eout.weight.requires_grad_(True)
             Eout.weight.register_hook(_hook)
 
+    ft_sampler_raie = data_bundle.finetune_sampler
     for ep in range(args.finetune_epochs):
         if is_distributed and ft_sampler_raie is not None:
             ft_sampler_raie.set_epoch(ep)
         loss = finetune_one_epoch_causal_anchor(
-            raie_model, ld_F_raie, device, item_final_token_ids,
+            raie_model, data_bundle.finetune_loader, device, item_final_token_ids,
             optimizer=FT_optim, scheduler=FT_sched, grad_clip=1.0,
             E0=E0, tune_token_ids=tune_token_ids, lambda_anchor=args.lambda_anchor, fp16=args.fp16,
             embed_model=rm
@@ -1696,19 +1802,19 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     bank = RegionBank(
         model=rm, tok=tok_raie,
         item_final_token_ids=item_final_token_ids,
-        original_ds=ds_trainO, device=device, out_dir=args.output_dir,
+        original_ds=data_bundle.ds_trainO, device=device, out_dir=args.output_dir,
         K=args.K, q=args.q, tau=args.tau, gamma=args.gamma, gap_thr=args.gap_thr,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout
     )
 
     if is_main:
         _ = bank.fit_regions_on_original(seed=args.seed)
-        region_buckets, soft_pairs = bank.map_finetune(ds_F, pool_min=120, bic_gain=1e4)
+        region_buckets, soft_pairs, bucket_weights = bank.map_finetune(data_bundle.ds_F, pool_min=120, bic_gain=1e4)
     else:
         bank.C = bank.R = bank.sig = bank.kappa = bank.pi = None
         bank.S = bank.n = None
         bank.orig_idx_by_k = {}
-        region_buckets = None; soft_pairs = None
+        region_buckets = None; soft_pairs = None; bucket_weights = None
     # ==== 在这里加 barrier，确保所有 rank 同步后再去创建/使用 gloo 组 ====
     if is_distributed:
         dist.barrier()
@@ -1723,11 +1829,13 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     bank.orig_idx_by_k = bcast_object(bank.orig_idx_by_k, src=0)
     region_buckets = bcast_object(region_buckets, src=0)
     soft_pairs = bcast_object(soft_pairs, src=0)
+    bucket_weights = bcast_object(bucket_weights, src=0)
 
     # —— 区域训练仅在 rank0 上进行，避免跨 rank 同步 ——
     if is_main:
+        weighted_buckets = apply_bucket_weights(region_buckets, bucket_weights, args.update_rep_factor)
         bank.train_regions(
-            finetune_ds=ds_F, collate_fn=collate,
+            finetune_ds=data_bundle.ds_F, collate_fn=collate,
             optimizer_ctor=lambda m: torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=args.lr),
             scheduler_ctor=lambda optim, steps_per_epoch, epochs: get_linear_schedule_with_warmup(
                 optim, int(args.warmup_ratio * steps_per_epoch * max(1, epochs)), steps_per_epoch * max(1, epochs)
@@ -1735,7 +1843,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
             epochs_per_region=args.raie_epochs_per_region,
             batch_size=args.finetune_batch_size,
             orig_mix_ratio=args.orig_mix_ratio,
-            region_buckets=region_buckets,  # 注意：这里用完整 buckets（含新建 region）
+            region_buckets=weighted_buckets,  # 权重映射后的 bucket
             soft_pairs=soft_pairs,
             soft_rep_factor=args.soft_rep_factor, fp16=args.fp16
         )
@@ -1745,10 +1853,10 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     if is_main:
         k_list = sorted(set(args.topk))
-        ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
-        ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
-        mO = bank.route_and_eval(ds_O, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
-        mT = bank.route_and_eval(ds_T, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
+        ld_O = DataLoader(data_bundle.ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+        ld_T = DataLoader(data_bundle.ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+        mO = bank.route_and_eval(data_bundle.ds_O, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
+        mT = bank.route_and_eval(data_bundle.ds_T, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
         with open(os.path.join(args.output_dir, "metrics_original_raie.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test_raie.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
         print("[Done] RAIE:", mO, mT)
@@ -1821,6 +1929,7 @@ def main():
     ap.add_argument("--soft_rep_factor", type=int, default=2)
     ap.add_argument("--raie_epochs_per_region", type=int, default=3)
     ap.add_argument("--lambda_anchor", type=float, default=1e-4)
+    ap.add_argument("--update_rep_factor", type=float, default=2.0)
 
     args = ap.parse_args()
 
