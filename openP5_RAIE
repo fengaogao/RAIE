@@ -713,7 +713,9 @@ class RegionBank:
                  device, out_dir: str,
                  K=3, q=0.9, T_low=0.7, T_high=0.9, tau=0.05, gamma=0.5, gap_thr=0.02,
                  lora_r=8, lora_alpha=16, lora_dropout=0.05,
-                 target_modules=("q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj")):
+                 target_modules=("q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"),
+                 beta_post: float = 8.0, delta_min: float = 0.05,
+                 n0: float = 5.0, kappa_ema: float = 0.2):
         self.model = model
         self.tok = tok
         self.item_final_token_ids = item_final_token_ids
@@ -725,12 +727,12 @@ class RegionBank:
         self.kappa = None; self.pi = None
         self.C0 = None
         self.K = K; self.q = q
-        self.beta_post = 8.0
-        self.delta_min = 0.05
+        self.beta_post = beta_post
+        self.delta_min = delta_min
         self.T_low = T_low; self.T_high = T_high
         self.tau = tau; self.gamma = gamma; self.gap_thr = gap_thr
-        self.n0 = 5.0
-        self.kappa_ema = 0.2
+        self.n0 = n0
+        self.kappa_ema = kappa_ema
 
         self.C = None; self.R = None; self.sig = None
         self.orig_idx_by_k = {}
@@ -1739,130 +1741,70 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     tok_raie, raie_model = fresh_lora_model_from_base(
         base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
     )
-    raie_model.load_adapter(default_dir, adapter_name="default", is_trainable=True); raie_model.set_adapter("default")
-
-    # Anchor 微调（DDP 包裹，但正则用 unwrap 模块）
-    if is_distributed:
-        raie_model = torch.nn.parallel.DistributedDataParallel(
-            raie_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-            output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False
-        )
-    rm = raie_model.module if hasattr(raie_model, "module") else raie_model
+    raie_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+    raie_model.set_adapter("default")
 
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     data_bundle = prepare_raie_data_bundle(args, tok_raie, mid2idx, n_items, is_distributed)
     collate = data_bundle.collate_fn
     item_final_token_ids = data_bundle.item_final_token_ids
 
-    FT_optim = torch.optim.AdamW([p for p in raie_model.parameters() if p.requires_grad], lr=args.lr)
-    FT_sched = get_linear_schedule_with_warmup(
-        FT_optim,
-        int(args.warmup_ratio * len(data_bundle.finetune_loader) * max(1, args.finetune_epochs)),
-        len(data_bundle.finetune_loader) * max(1, args.finetune_epochs)
-    )
-
-    Ein = rm.get_input_embeddings()
-    E0 = Ein.weight.detach().clone()
-    f_item_token_ids = set()
-    for r in data_bundle.ds_F.examples:
-        tgt_idx = int(r["target_item_idx"].item())
-        tid = item_final_token_ids[tgt_idx]
-        f_item_token_ids.add(int(tid))
-    tune_token_ids = torch.tensor(sorted(list(f_item_token_ids)), device=Ein.weight.device, dtype=torch.long) \
-                      if len(f_item_token_ids) > 0 else None
-    Ein.weight.requires_grad_(True)
-    if tune_token_ids is not None and tune_token_ids.numel() > 0:
-        grad_mask = torch.zeros_like(Ein.weight, dtype=torch.bool); grad_mask[tune_token_ids] = True
-        def _hook(g): return g.masked_fill(~grad_mask, 0)
-        Ein.weight.register_hook(_hook)
-        Eout = rm.get_output_embeddings()
-        if Eout is not None and Eout.weight is not Ein.weight:
-            Eout.weight.requires_grad_(True)
-            Eout.weight.register_hook(_hook)
-
-    ft_sampler_raie = data_bundle.finetune_sampler
-    for ep in range(args.finetune_epochs):
-        if is_distributed and ft_sampler_raie is not None:
-            ft_sampler_raie.set_epoch(ep)
-        loss = finetune_one_epoch_causal_anchor(
-            raie_model, data_bundle.finetune_loader, device, item_final_token_ids,
-            optimizer=FT_optim, scheduler=FT_sched, grad_clip=1.0,
-            E0=E0, tune_token_ids=tune_token_ids, lambda_anchor=args.lambda_anchor, fp16=args.fp16,
-            embed_model=rm
-        )
-        if is_main: print(f"[RAIE][F-anchor] epoch={ep+1} loss={loss:.4f}")
-
-    # 保存 default（供区域适配器初始化/fallback）
-    if is_main:
-        default_dir2 = os.path.join(args.output_dir, "default_for_raie")
-        ensure_dir(default_dir2)
-        rm.save_pretrained(default_dir2, selected_adapters=["default"])
-
-    # 拟合区域 + region 分片训练（仅 rm 非 DDP，用 rm）
     bank = RegionBank(
-        model=rm, tok=tok_raie,
+        model=raie_model, tok=tok_raie,
         item_final_token_ids=item_final_token_ids,
         original_ds=data_bundle.ds_trainO, device=device, out_dir=args.output_dir,
         K=args.K, q=args.q, tau=args.tau, gamma=args.gamma, gap_thr=args.gap_thr,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        beta_post=args.raie_beta_post, delta_min=args.raie_delta_min,
+        n0=args.raie_n0, kappa_ema=args.raie_kappa_ema,
+    )
+
+    _ = bank.fit_regions_on_original(seed=args.seed)
+    region_buckets, soft_pairs, _ = bank.map_finetune(
+        data_bundle.ds_F, pool_min=args.raie_pool_min, bic_gain=1e4
+    )
+
+    no_decay = ['bias', 'LayerNorm.weight']
+
+    def _optim_ctor(m):
+        params = [
+            {'params': [p for n, p in m.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
+            {'params': [p for n, p in m.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
+        ]
+        return torch.optim.AdamW([g for g in params if len(g['params']) > 0], lr=args.lr)
+
+    def _sched_ctor(optim, steps_per_epoch, epochs):
+        total = steps_per_epoch * epochs
+        warm = int(total * args.warmup_ratio)
+        return torch.optim.lr_scheduler.LambdaLR(
+            optim, lr_lambda=lambda step: min((step + 1) / max(1, warm), 1.0)
+        )
+
+    bank.train_regions(
+        finetune_ds=data_bundle.ds_F, collate_fn=collate,
+        optimizer_ctor=_optim_ctor,
+        scheduler_ctor=_sched_ctor,
+        epochs_per_region=args.raie_epochs_per_region,
+        batch_size=args.finetune_batch_size,
+        orig_mix_ratio=args.raie_orig_mix_ratio,
+        region_buckets=region_buckets,
+        soft_pairs=soft_pairs,
+        soft_rep_factor=args.raie_soft_rep_factor,
+        fp16=args.fp16,
+        seed=args.seed,
     )
 
     if is_main:
-        _ = bank.fit_regions_on_original(seed=args.seed)
-        region_buckets, soft_pairs, bucket_weights = bank.map_finetune(data_bundle.ds_F, pool_min=120, bic_gain=1e4)
-    else:
-        bank.C = bank.R = bank.sig = bank.kappa = bank.pi = None
-        bank.S = bank.n = None
-        bank.orig_idx_by_k = {}
-        region_buckets = None; soft_pairs = None; bucket_weights = None
-    # ==== 在这里加 barrier，确保所有 rank 同步后再去创建/使用 gloo 组 ====
-    if is_distributed:
-        dist.barrier()
-
-    bank.C = bcast_object(bank.C, src=0)
-    bank.R = bcast_object(bank.R, src=0)
-    bank.sig = bcast_object(bank.sig, src=0)
-    bank.kappa = bcast_object(bank.kappa, src=0)
-    bank.pi = bcast_object(bank.pi, src=0)
-    bank.S = bcast_object(bank.S, src=0)
-    bank.n = bcast_object(bank.n, src=0)
-    bank.orig_idx_by_k = bcast_object(bank.orig_idx_by_k, src=0)
-    region_buckets = bcast_object(region_buckets, src=0)
-    soft_pairs = bcast_object(soft_pairs, src=0)
-    bucket_weights = bcast_object(bucket_weights, src=0)
-
-    # —— 区域训练仅在 rank0 上进行，避免跨 rank 同步 ——
-    if is_main:
-        weighted_buckets = apply_bucket_weights(region_buckets, bucket_weights, args.update_rep_factor)
-        bank.train_regions(
-            finetune_ds=data_bundle.ds_F, collate_fn=collate,
-            optimizer_ctor=lambda m: torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=args.lr),
-            scheduler_ctor=lambda optim, steps_per_epoch, epochs: get_linear_schedule_with_warmup(
-                optim, int(args.warmup_ratio * steps_per_epoch * max(1, epochs)), steps_per_epoch * max(1, epochs)
-            ),
-            epochs_per_region=args.raie_epochs_per_region,
-            batch_size=args.finetune_batch_size,
-            orig_mix_ratio=args.orig_mix_ratio,
-            region_buckets=weighted_buckets,  # 权重映射后的 bucket
-            soft_pairs=soft_pairs,
-            soft_rep_factor=args.soft_rep_factor, fp16=args.fp16
-        )
-
-    if is_distributed:
-        dist.barrier()  # 等 rank0 训练并落盘所有 region 适配器
-
-    if is_main:
         k_list = sorted(set(args.topk))
-        ld_O = DataLoader(data_bundle.ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
-        ld_T = DataLoader(data_bundle.ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
         mO = bank.route_and_eval(data_bundle.ds_O, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
         mT = bank.route_and_eval(data_bundle.ds_T, collate, k_list=k_list, root=args.output_dir, batch_size=256, fp16=args.fp16)
-        with open(os.path.join(args.output_dir, "metrics_original_raie.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
-        with open(os.path.join(args.output_dir, "metrics_test_raie.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_original_raie.json"), "w", encoding="utf-8") as f:
+            json.dump(mO, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_test_raie.json"), "w", encoding="utf-8") as f:
+            json.dump(mT, f, ensure_ascii=False, indent=2)
         print("[Done] RAIE:", mO, mT)
 
-    _free_cuda(raie_model, rm)
-    if is_distributed: dist.barrier()
+    _free_cuda(raie_model)
 
 # ------------------------------
 # 主流程（新增 --stage 分流）
@@ -1930,6 +1872,13 @@ def main():
     ap.add_argument("--raie_epochs_per_region", type=int, default=3)
     ap.add_argument("--lambda_anchor", type=float, default=1e-4)
     ap.add_argument("--update_rep_factor", type=float, default=2.0)
+    ap.add_argument("--raie_pool_min", type=int, default=120)
+    ap.add_argument("--raie_orig_mix_ratio", type=float, default=0.3)
+    ap.add_argument("--raie_soft_rep_factor", type=int, default=2)
+    ap.add_argument("--raie_beta_post", type=float, default=8.0)
+    ap.add_argument("--raie_delta_min", type=float, default=0.05)
+    ap.add_argument("--raie_n0", type=float, default=5.0)
+    ap.add_argument("--raie_kappa_ema", type=float, default=0.2)
 
     args = ap.parse_args()
 
