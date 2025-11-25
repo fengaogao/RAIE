@@ -473,6 +473,133 @@ def lwf_kd_loss_bert(
     return alpha * kd
 
 # ------------------------------
+# MoLE: Mixture-of-LoRA-Experts
+# ------------------------------
+
+class _Output:
+    def __init__(self, logits, loss=None, gate=None):
+        self.logits = logits
+        self.loss = loss
+        self.gate = gate
+
+
+class MoLEMixture(nn.Module):
+    """Mixture-of-LoRA-Experts.
+
+    We build multiple LoRA adapters on top of the shared Bert backbone and
+    train a lightweight gating network that selects experts conditioned on
+    the current sequence (pooling input embeddings). The design follows the
+    MoLE intuition from https://arxiv.org/pdf/2404.13628 without depending on
+    external code.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        adapter_names: List[str],
+        item_token_ids: List[int],
+        gating_hidden: int = 128,
+        temperature: float = 0.7,
+        balance_coef: float = 0.01,
+    ):
+        super().__init__()
+        self.model = base_model
+        self.adapter_names = list(adapter_names)
+        self.temperature = max(temperature, 1e-4)
+        self.balance_coef = max(0.0, balance_coef)
+        self.item_token_ids = item_token_ids
+
+        emb = self.model.get_input_embeddings()
+        dim = emb.embedding_dim
+        self.gate = nn.Sequential(
+            nn.Linear(dim, gating_hidden),
+            nn.Tanh(),
+            nn.Linear(gating_hidden, len(self.adapter_names)),
+        )
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        # ----- Gating (no encoder forward) -----
+        with torch.set_grad_enabled(self.training):
+            emb = self.model.get_input_embeddings()(input_ids)
+            mask = attention_mask.unsqueeze(-1)
+            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            gate_logits = self.gate(pooled) / self.temperature
+            gate_weights = F.softmax(gate_logits, dim=-1)
+
+        # ----- Expert forwards -----
+        logits_list = []
+        for name in self.adapter_names:
+            if hasattr(self.model, "set_adapter"):
+                try:
+                    self.model.set_adapter(name)
+                except Exception:
+                    pass
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            logits_list.append(out.logits)
+
+        logits_stack = torch.stack(logits_list, dim=1)  # [B, E, L, V]
+        mix_logits = torch.einsum('be,belv->blv', gate_weights, logits_stack)
+
+        loss = None
+        if labels is not None:
+            final_pos = attention_mask.sum(dim=1) - 1
+            rows = torch.arange(input_ids.size(0), device=input_ids.device)
+            logits_final = mix_logits[rows, final_pos, :]
+
+            V = logits_final.size(-1)
+            mask_vec = torch.full((V,), float('-inf'), device=input_ids.device)
+            mask_vec[self.item_token_ids] = 0.0
+            logits_final = logits_final + mask_vec
+
+            base_loss = F.cross_entropy(logits_final, labels)
+            balance_loss = torch.tensor(0.0, device=input_ids.device)
+            if self.balance_coef > 0:
+                avg_gate = gate_weights.mean(dim=0)
+                uniform = torch.full_like(avg_gate, 1.0 / len(self.adapter_names))
+                balance_loss = self.balance_coef * F.kl_div(
+                    (avg_gate + 1e-8).log(), uniform, reduction='batchmean'
+                )
+            loss = base_loss + balance_loss
+
+        return _Output(logits=mix_logits, loss=loss, gate=gate_weights)
+
+
+def finetune_one_epoch_mole(
+    mole_model: MoLEMixture,
+    finetune_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    grad_clip: float = 1.0,
+    log_every: int = 100,
+) -> float:
+    mole_model.train()
+    total_loss = 0.0
+    n_steps = 0
+
+    for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE", leave=False), start=1):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        out = mole_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = out.loss
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(mole_model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item()
+        n_steps += 1
+        if (log_every is not None) and (log_every > 0) and (step % log_every == 0):
+            print(f"[MoLE][step {step}] loss={loss.item():.4f}")
+
+    return total_loss / max(n_steps, 1)
+
+# ------------------------------
 # F-stage: LoRA finetuning (通用，供 mode 2~4 使用)
 # ------------------------------
 def finetune_one_epoch_lora(
@@ -1331,8 +1458,8 @@ def evaluate_lsat(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='lora_lwf',
-                        choices=['base','lora','lora_replay','lora_lwf','lsat','raie'],
-                        help='6种方案：base / lora / lora_replay / lora_lwf / lsat / raie')
+                        choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
+                        help='7种方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
     parser.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/',
                         help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl(or original.jsonl), item_ids.json')
     parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_Amazon_electronics')
@@ -1384,6 +1511,16 @@ def main():
     parser.add_argument('--lora_target', type=str,
                         default='query, key, value, intermediate.dense, output.dense, attention.output.dense')
 
+    # MoLE args
+    parser.add_argument('--mole_num_experts', type=int, default=4,
+                        help='Number of LoRA experts to mix (including the default adapter)')
+    parser.add_argument('--mole_gating_hidden', type=int, default=128,
+                        help='Hidden size of the gating MLP')
+    parser.add_argument('--mole_temp', type=float, default=0.7,
+                        help='Softmax temperature for gating')
+    parser.add_argument('--mole_balance', type=float, default=0.01,
+                        help='KL regularization weight encouraging balanced expert usage')
+
     # RAIE args（与你原实现一致且可调）
     parser.add_argument('--K', type=int, default=3)
     parser.add_argument('--q', type=float, default=0.9)
@@ -1402,7 +1539,7 @@ def main():
     args = parser.parse_args()
 
     # sanity
-    if args.mode in ('lora','lora_replay','lora_lwf','lsat','raie') and (not PEFT_AVAILABLE):
+    if args.mode in ('lora','lora_replay','lora_lwf','lsat','raie','mole') and (not PEFT_AVAILABLE):
         raise RuntimeError(f"peft not available: {_PEFT_ERR}")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1646,6 +1783,71 @@ def main():
         lora_dir = os.path.join(args.output_dir, f'lora_adapter_{tag}')
         os.makedirs(lora_dir, exist_ok=True)
         lora_model.save_pretrained(lora_dir)
+        return
+
+    # ---------- 新方案：MoLE (Mixture-of-LoRA-Experts) ----------
+    if args.mode == 'mole':
+        if (finetune_ds is None) or (len(finetune_ds) == 0):
+            raise RuntimeError('[MoLE] finetune.jsonl is required.')
+
+        FT_loader = DataLoader(finetune_ds, batch_size=args.finetune_batch_size, shuffle=True, num_workers=2,
+                               collate_fn=FT_collator)
+
+        num_exp = max(1, args.mole_num_experts)
+        adapter_names: List[str] = []
+        for i in range(num_exp):
+            name = 'default' if i == 0 else f'expert_{i}'
+            adapter_names.append(name)
+            if name not in getattr(lora_model, 'peft_config', {}):
+                lora_model.add_adapter(name, lora_cfg)
+            if hasattr(lora_model, "train_adapter"):
+                try:
+                    lora_model.train_adapter(name)
+                except Exception:
+                    pass
+
+        mole_model = MoLEMixture(
+            base_model=lora_model,
+            adapter_names=adapter_names,
+            item_token_ids=item_token_ids,
+            gating_hidden=args.mole_gating_hidden,
+            temperature=args.mole_temp,
+            balance_coef=args.mole_balance,
+        ).to(device)
+
+        no_decay = ['bias', 'LayerNorm.weight']
+        params = [
+            {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
+             "weight_decay": args.weight_decay},
+            {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
+             "weight_decay": 0.0},
+        ]
+        ft_optim = torch.optim.AdamW(params, lr=args.finetune_lr)
+        ft_steps = len(FT_loader) * max(args.finetune_epochs, 1)
+        ft_warm = int(ft_steps * args.warmup_ratio)
+        ft_sched = get_linear_schedule_with_warmup(ft_optim, num_warmup_steps=ft_warm, num_training_steps=ft_steps)
+
+        for ep in range(1, args.finetune_epochs + 1):
+            ft_loss = finetune_one_epoch_mole(
+                mole_model, FT_loader, ft_optim, ft_sched, device,
+                grad_clip=args.grad_clip, log_every=100
+            )
+            print(f"[MoLE][Epoch {ep}] loss={ft_loss:.4f}")
+
+        metrics = evaluate(mole_model, test_loader, device, item_token_ids, topk=topk_tuple)
+        print("[Test][MoLE]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
+        with open(os.path.join(args.output_dir, 'test_metrics_mole.json'), 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+        mole_dir = os.path.join(args.output_dir, 'mole_adapters')
+        os.makedirs(mole_dir, exist_ok=True)
+        lora_model.save_pretrained(mole_dir, selected_adapters=adapter_names)
+        torch.save({
+            'gate_state': mole_model.gate.state_dict(),
+            'adapter_names': adapter_names,
+            'temperature': args.mole_temp,
+            'balance_coef': args.mole_balance,
+        }, os.path.join(mole_dir, 'mole_gate.pt'))
         return
 
     # ---------- 方案5：RAIE ----------
