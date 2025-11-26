@@ -522,7 +522,12 @@ class MoLEMixture(nn.Module):
         with torch.set_grad_enabled(self.training):
             emb = self.model.get_input_embeddings()(input_ids)
             mask = attention_mask.unsqueeze(-1)
-            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            # Avoid accidentally keeping an extra dimension (B, 1, 1) which would
+            # broadcast the batch dimension and make gate_weights 3D, breaking
+            # the expert mixing einsum. Using a 2D mask sum keeps pooling stable
+            # and results in gate_weights of shape [B, E].
+            mask_sum = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+            pooled = (emb * mask).sum(dim=1) / mask_sum  # [B, D]
             gate_logits = self.gate(pooled) / self.temperature
             gate_weights = F.softmax(gate_logits, dim=-1)
 
