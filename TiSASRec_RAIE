@@ -545,6 +545,129 @@ def lwf_kd_loss_tisasrec(student: nn.Module, teacher: TiSASRec,
     kd = F.kl_div(s_log_probs, t_probs, reduction='batchmean') * (T*T)
     return alpha * kd
 
+
+class _MoLEOutput:
+    def __init__(self, logits, loss=None, gate=None):
+        self.logits = logits
+        self.loss = loss
+        self.gate = gate
+
+
+class MoLEMixture(nn.Module):
+    """Mixture-of-LoRA-Experts for TiSASRec."""
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        adapter_names: List[str],
+        item_token_ids: List[int],
+        pad_id: int,
+        gating_hidden: int = 128,
+        temperature: float = 0.7,
+        balance_coef: float = 0.01,
+    ):
+        super().__init__()
+        self.model = base_model
+        self.adapter_names = list(adapter_names)
+        self.item_token_ids = item_token_ids
+        self.pad_id = pad_id
+        self.temperature = max(temperature, 1e-4)
+        self.balance_coef = max(0.0, balance_coef)
+
+        emb_layer = self._get_input_emb()
+        dim = emb_layer.embedding_dim
+        self.gate = nn.Sequential(
+            nn.Linear(dim, gating_hidden),
+            nn.Tanh(),
+            nn.Linear(gating_hidden, len(self.adapter_names)),
+        )
+
+    def _get_input_emb(self):
+        if hasattr(self.model, "get_input_embeddings"):
+            emb = self.model.get_input_embeddings()
+            if emb is not None:
+                return emb
+        if hasattr(self.model, "item_emb"):
+            return self.model.item_emb
+        raise RuntimeError("Model does not expose input embeddings for MoLE gating.")
+
+    def forward(self, seq_ids, attn_mask, t_buckets, seqlen, labels=None):
+        with torch.set_grad_enabled(self.training):
+            emb_layer = self._get_input_emb()
+            emb = emb_layer(seq_ids)
+            mask = (seq_ids != self.pad_id).unsqueeze(-1).float()
+            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+            gate_logits = self.gate(pooled) / self.temperature
+            gate_weights = F.softmax(gate_logits, dim=-1)
+
+        logits_list = []
+        for name in self.adapter_names:
+            if hasattr(self.model, "set_adapter"):
+                try:
+                    self.model.set_adapter(name)
+                except Exception:
+                    pass
+            h = self.model(seq_ids=seq_ids, attn_mask=attn_mask, t_buckets=t_buckets, pad_id=self.pad_id)
+            logits = self.model.predict_last(h, seqlen)
+            logits_list.append(logits)
+
+        logits_stack = torch.stack(logits_list, dim=1)  # [B, E, V]
+        mix_logits = torch.einsum('be,bev->bv', gate_weights, logits_stack)
+
+        loss = None
+        if labels is not None:
+            logits_final = _masked_item_logits(mix_logits, self.item_token_ids)
+            base_loss = F.cross_entropy(logits_final, labels)
+            balance_loss = torch.tensor(0.0, device=logits_final.device)
+            if self.balance_coef > 0:
+                avg_gate = gate_weights.mean(dim=0)
+                uniform = torch.full_like(avg_gate, 1.0 / len(self.adapter_names))
+                balance_loss = self.balance_coef * F.kl_div(
+                    (avg_gate + 1e-8).log(), uniform, reduction='batchmean'
+                )
+            loss = base_loss + balance_loss
+
+        return _MoLEOutput(logits=mix_logits, loss=loss, gate=gate_weights)
+
+
+def finetune_one_epoch_mole(
+    mole_model: MoLEMixture,
+    finetune_loader: DataLoader,
+    optimizer,
+    scheduler,
+    device,
+    grad_clip: float = 1.0,
+    log_every: int = 100,
+):
+    mole_model.train()
+    total_loss = 0.0
+    n_steps = 0
+
+    for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE", leave=False), start=1):
+        seq = batch['seq'].to(device)
+        t_bk = batch['t_buckets'].to(device)
+        attn_mask = batch['attn_mask'].to(device)
+        labels = batch['labels'].to(device)
+        seqlen = batch['seqlen'].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        out = mole_model(seq_ids=seq, attn_mask=attn_mask, t_buckets=t_bk, seqlen=seqlen, labels=labels)
+        loss = out.loss
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(mole_model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item()
+        n_steps += 1
+        if (log_every is not None) and (log_every > 0) and (step % log_every == 0):
+            print(f"[MoLE][step {step}] loss={loss.item():.4f}")
+
+    return total_loss / max(n_steps, 1)
+
+
 def train_one_epoch(model: TiSASRec, loader: DataLoader, optimizer, scheduler,
                     device, pad_id, item_token_ids, grad_clip: float):
     model.train()
@@ -649,6 +772,90 @@ def evaluate(model: nn.Module, loader: DataLoader, device, pad_id, item_token_id
             sumd[K]['hit'] += sums[K]['hit']
             sumd[K]['dcg'] += sums[K]['dcg']
         N += bsz
+    return aggregate_metrics(sumd, N, topk=tuple(topk))
+
+
+def _adapter_final_logits_tisas(
+    model: nn.Module,
+    adapter_name: str,
+    seq: torch.Tensor,
+    attn_mask: torch.Tensor,
+    t_buckets: torch.Tensor,
+    seqlen: torch.Tensor,
+    pad_id: int,
+    item_token_ids: List[int],
+):
+    if hasattr(model, "set_adapter"):
+        try:
+            model.set_adapter(adapter_name)
+        except Exception:
+            pass
+    h = model(seq_ids=seq, attn_mask=attn_mask, t_buckets=t_buckets, pad_id=pad_id)
+    logits = model.predict_last(h, seqlen)
+    return _masked_item_logits(logits, item_token_ids)
+
+
+@torch.no_grad()
+def evaluate_lsat_tisas(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    pad_id: int,
+    item_token_ids: List[int],
+    long_adapter: str,
+    short_adapter: str,
+    alpha: float = 0.5,
+    topk: Tuple[int, ...] = (5, 10, 20),
+):
+    alpha = float(max(0.0, min(1.0, alpha)))
+    sumd = {k:{'hit':0.0,'dcg':0.0} for k in topk}; N = 0
+
+    for batch in tqdm(loader, desc='Eval-LSAT', leave=False):
+        seq = batch['seq'].to(device)
+        t_bk = batch['t_buckets'].to(device)
+        attn_mask = batch['attn_mask'].to(device)
+        labels = batch['labels'].to(device)
+        seqlen = batch['seqlen'].to(device)
+
+        logits_long = _adapter_final_logits_tisas(model, long_adapter, seq, attn_mask, t_bk, seqlen, pad_id, item_token_ids)
+        logits_short = _adapter_final_logits_tisas(model, short_adapter, seq, attn_mask, t_bk, seqlen, pad_id, item_token_ids)
+        logits_final = alpha * logits_long + (1.0 - alpha) * logits_short
+
+        sums, bsz = recall_ndcg_sums(logits_final, labels, item_token_ids, topk=tuple(topk))
+        for K in sums:
+            sumd[K]['hit'] += sums[K]['hit']
+            sumd[K]['dcg'] += sums[K]['dcg']
+        N += bsz
+
+    return aggregate_metrics(sumd, N, topk=tuple(topk))
+
+
+@torch.no_grad()
+def evaluate_mole_tisas(
+    mole_model: MoLEMixture,
+    loader: DataLoader,
+    device: torch.device,
+    pad_id: int,
+    item_token_ids: List[int],
+    topk: Tuple[int, ...] = (5, 10, 20),
+):
+    mole_model.eval()
+    sumd = {k:{'hit':0.0,'dcg':0.0} for k in topk}; N = 0
+    for batch in tqdm(loader, desc='Eval-MoLE', leave=False):
+        seq = batch['seq'].to(device)
+        t_bk = batch['t_buckets'].to(device)
+        attn_mask = batch['attn_mask'].to(device)
+        labels = batch['labels'].to(device)
+        seqlen = batch['seqlen'].to(device)
+
+        out = mole_model(seq_ids=seq, attn_mask=attn_mask, t_buckets=t_bk, seqlen=seqlen)
+        logits = _masked_item_logits(out.logits, item_token_ids)
+        sums, bsz = recall_ndcg_sums(logits, labels, item_token_ids, topk=tuple(topk))
+        for K in sums:
+            sumd[K]['hit'] += sums[K]['hit']
+            sumd[K]['dcg'] += sums[K]['dcg']
+        N += bsz
+
     return aggregate_metrics(sumd, N, topk=tuple(topk))
 
 
@@ -1178,10 +1385,10 @@ class RegionBankTiSAS:
 
 def main():
     ap = argparse.ArgumentParser()
-    # 新增：五模式开关
+    # 新增：模式开关
     ap.add_argument('--mode', type=str, default='raie',
-                    choices=['base', 'lora', 'lora_replay', 'lora_lwf', 'raie'],
-                    help='五种方式：base / lora / lora_replay / lora_lwf / raie')
+                    choices=['base', 'lora', 'lora_replay', 'lora_lwf', 'lsat', 'raie', 'mole'],
+                    help='方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
 
     ap.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/')
     ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_Amazon_electronics')
@@ -1231,6 +1438,17 @@ def main():
                     default='Wq,Wk,Wv,Wo,ffn.0,ffn.3',
                     help='逗号分隔的模块名（支持子串匹配），例如 "Wq,Wk,Wv,Wo,ffn.0,ffn.3"')
 
+    # ---- LSAT args ----
+    ap.add_argument('--lsat_alpha', type=float, default=0.6, help='Long-term adapter weight for LSAT logit fusion')
+    ap.add_argument('--lsat_long_epochs', type=int, default=1, help='Epochs for long-term adapter refinement')
+    ap.add_argument('--lsat_short_epochs', type=int, default=3, help='Epochs for short-term adapter tuning')
+
+    # ---- MoLE args ----
+    ap.add_argument('--mole_num_experts', type=int, default=4, help='Number of LoRA experts for MoLE')
+    ap.add_argument('--mole_gating_hidden', type=int, default=128, help='Hidden size of MoLE gating MLP')
+    ap.add_argument('--mole_temp', type=float, default=0.7, help='Temperature for MoLE gating softmax')
+    ap.add_argument('--mole_balance', type=float, default=0.01, help='KL regularization weight for balanced routing')
+
     # ===== RAIE plugin switches =====
     ap.add_argument('--raie_enable', action='store_true', default=True, help='启用 RAIE 区域化 LoRA 插件')
     ap.add_argument('--raie_K', type=int, default=3)
@@ -1250,8 +1468,8 @@ def main():
 
     args = ap.parse_args()
 
-    # ---------- 五模式到内部开关的映射（不改变模块内逻辑，只调流程） ----------
-    # 统一禁用 EWC（你的五模式不包含）；RAIE 独立由 raie_enable 控制
+    # ---------- 模式到内部开关的映射（不改变模块内逻辑，只调流程） ----------
+    # 统一禁用 EWC；RAIE 独立由 raie_enable 控制
     if args.mode == 'base':
         args.use_lora = False
         args.plugin = 'none'
@@ -1268,10 +1486,18 @@ def main():
         args.use_lora = True
         args.plugin = 'lwf'
         args.raie_enable = False
+    elif args.mode == 'lsat':
+        args.use_lora = True
+        args.plugin = 'none'
+        args.raie_enable = False
     elif args.mode == 'raie':
         args.use_lora = True
         args.plugin = 'none'   # RAIE 自己走 Stage-R
         args.raie_enable = True
+    elif args.mode == 'mole':
+        args.use_lora = True
+        args.plugin = 'none'
+        args.raie_enable = False
 
     if args.use_lora and (not PEFT_AVAILABLE):
         raise RuntimeError(f"peft not available: {_PEFT_ERR}")
@@ -1351,6 +1577,167 @@ def main():
         for p in teacher.parameters(): p.requires_grad = False
         teacher.eval()
 
+    target_modules = [s.strip() for s in args.lora_target.split(',') if s.strip()]
+    topk_tuple = tuple(int(x) for x in args.topk.split(','))
+
+    # 特殊模式：LSAT（长/短 LoRA 融合）
+    if args.mode == 'lsat':
+        if finetune_ds is None or len(finetune_ds) == 0:
+            raise RuntimeError('[LSAT] finetune.jsonl is required.')
+
+        lora_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            bias='none', task_type=TaskType.FEATURE_EXTRACTION, target_modules=target_modules,
+        )
+        lora_model = get_peft_model(base_model, lora_cfg).to(device)
+        try:
+            lora_model.print_trainable_parameters()
+        except Exception:
+            pass
+
+        long_adapter = 'default'
+        short_adapter = 'short_term'
+        if short_adapter not in getattr(lora_model, 'peft_config', {}):
+            lora_model.add_adapter(short_adapter, lora_cfg)
+
+        if hasattr(lora_model, "set_adapter"):
+            try:
+                lora_model.set_adapter(long_adapter)
+                if hasattr(lora_model, "train_adapter"):
+                    lora_model.train_adapter(long_adapter)
+            except Exception:
+                pass
+
+        long_params = [p for p in lora_model.parameters() if p.requires_grad]
+        long_optim = torch.optim.AdamW(long_params, lr=args.finetune_lr)
+        long_steps = len(train_loader) * max(args.lsat_long_epochs, 1)
+        long_warm = int(long_steps * args.warmup_ratio)
+        long_sched = torch.optim.lr_scheduler.LambdaLR(
+            long_optim, lr_lambda=lambda step: min((step + 1) / max(1, long_warm), 1.0)
+        )
+        for ep in range(1, args.lsat_long_epochs + 1):
+            tr = train_one_epoch(lora_model, train_loader, long_optim, long_sched, device, pad_id, item_token_ids, args.grad_clip)
+            print(f"[LSAT][Long][Epoch {ep}] train_loss={tr:.4f}")
+
+        FT_loader = DataLoader(finetune_ds, batch_size=args.finetune_batch_size, shuffle=True, num_workers=2, collate_fn=collate)
+        if hasattr(lora_model, "set_adapter"):
+            try:
+                lora_model.set_adapter(short_adapter)
+                if hasattr(lora_model, "train_adapter"):
+                    lora_model.train_adapter(short_adapter)
+            except Exception:
+                pass
+
+        ft_item_ids = sorted({token2id.get(ex.target_token, None)
+                              for ex in finetune_ds.examples
+                              if token2id.get(ex.target_token, None) in item_token_ids})
+        ids_t = torch.tensor(ft_item_ids, device=device) if len(ft_item_ids) > 0 else None
+        E0 = lora_model.base_model.item_emb.weight.detach().clone() if hasattr(lora_model, "base_model") else lora_model.item_emb.weight.detach().clone()
+        lambda_anchor = 1e-4
+
+        ft_params = [p for p in lora_model.parameters() if p.requires_grad]
+        ft_optim = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
+        ft_steps = len(FT_loader) * max(args.lsat_short_epochs, 1)
+        ft_warm = int(ft_steps * args.warmup_ratio)
+        ft_sched = torch.optim.lr_scheduler.LambdaLR(
+            ft_optim, lr_lambda=lambda step: min((step + 1) / max(1, ft_warm), 1.0)
+        )
+
+        for ep in range(1, args.lsat_short_epochs + 1):
+            ft_loss = finetune_one_epoch(
+                lora_model, FT_loader, ft_optim, ft_sched, device, pad_id, item_token_ids,
+                args.grad_clip, plugin='none', replay_buf=None, ewc_state=None, teacher=None,
+                replay_ratio=args.replay_ratio, lwf_T=args.lwf_T, lwf_alpha=args.lwf_alpha,
+                E0=E0, ids_t=ids_t, lambda_anchor=lambda_anchor,
+            )
+            print(f"[LSAT][Short][Epoch {ep}] loss={ft_loss:.4f}")
+
+        metrics = evaluate_lsat_tisas(
+            lora_model, test_loader, device, pad_id, item_token_ids,
+            long_adapter=long_adapter, short_adapter=short_adapter,
+            alpha=args.lsat_alpha, topk=topk_tuple,
+        )
+        print("[Test][lsat]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
+        with open(os.path.join(args.output_dir, 'test_metrics_lsat.json'), 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        long_dir = os.path.join(args.output_dir, 'lora_adapter_lsat_long')
+        short_dir = os.path.join(args.output_dir, 'lora_adapter_lsat_short')
+        os.makedirs(long_dir, exist_ok=True); os.makedirs(short_dir, exist_ok=True)
+        lora_model.save_pretrained(long_dir, selected_adapters=[long_adapter])
+        lora_model.save_pretrained(short_dir, selected_adapters=[short_adapter])
+        return
+
+    # 特殊模式：MoLE（多专家 LoRA）
+    if args.mode == 'mole':
+        if finetune_ds is None or len(finetune_ds) == 0:
+            raise RuntimeError('[MoLE] finetune.jsonl is required.')
+
+        lora_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            bias='none', task_type=TaskType.FEATURE_EXTRACTION, target_modules=target_modules,
+        )
+        lora_model = get_peft_model(base_model, lora_cfg).to(device)
+        adapter_names: List[str] = []
+        num_exp = max(1, args.mole_num_experts)
+        for i in range(num_exp):
+            name = 'default' if i == 0 else f'expert_{i}'
+            adapter_names.append(name)
+            if name not in getattr(lora_model, 'peft_config', {}):
+                lora_model.add_adapter(name, lora_cfg)
+            if hasattr(lora_model, "set_adapter"):
+                try:
+                    lora_model.set_adapter(name)
+                    if hasattr(lora_model, "train_adapter"):
+                        lora_model.train_adapter(name)
+                except Exception:
+                    pass
+
+        FT_loader = DataLoader(finetune_ds, batch_size=args.finetune_batch_size, shuffle=True, num_workers=2, collate_fn=collate)
+        mole_model = MoLEMixture(
+            base_model=lora_model,
+            adapter_names=adapter_names,
+            item_token_ids=item_token_ids,
+            pad_id=pad_id,
+            gating_hidden=args.mole_gating_hidden,
+            temperature=args.mole_temp,
+            balance_coef=args.mole_balance,
+        ).to(device)
+
+        no_decay = ['bias', 'LayerNorm.weight']
+        params = [
+            {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
+            {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+        ]
+        ft_optim = torch.optim.AdamW(params, lr=args.finetune_lr)
+        ft_steps = len(FT_loader) * max(args.finetune_epochs, 1)
+        ft_warm = int(ft_steps * args.warmup_ratio)
+        ft_sched = torch.optim.lr_scheduler.LambdaLR(
+            ft_optim, lr_lambda=lambda step: min((step + 1) / max(1, ft_warm), 1.0)
+        )
+
+        for ep in range(1, args.finetune_epochs + 1):
+            ft_loss = finetune_one_epoch_mole(
+                mole_model, FT_loader, ft_optim, ft_sched, device,
+                grad_clip=args.grad_clip, log_every=100,
+            )
+            print(f"[MoLE][Epoch {ep}] loss={ft_loss:.4f}")
+
+        metrics = evaluate_mole_tisas(mole_model, test_loader, device, pad_id, item_token_ids, topk=topk_tuple)
+        print("[Test][mole]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
+        with open(os.path.join(args.output_dir, 'test_metrics_mole.json'), 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+        mole_dir = os.path.join(args.output_dir, 'mole_adapters')
+        os.makedirs(mole_dir, exist_ok=True)
+        lora_model.save_pretrained(mole_dir, selected_adapters=adapter_names)
+        torch.save({
+            'gate_state': mole_model.gate.state_dict(),
+            'adapter_names': adapter_names,
+            'temperature': args.mole_temp,
+            'balance_coef': args.mole_balance,
+        }, os.path.join(mole_dir, 'mole_gate.pt'))
+        return
+
     # ========== Stage F：按模式选择是否进行 ==========
     model = base_model
     did_f_stage = False
@@ -1369,7 +1756,6 @@ def main():
         E0 = base_model.item_emb.weight.detach().clone()
 
         # LoRA 包裹
-        target_modules = [s.strip() for s in args.lora_target.split(',') if s.strip()]
         lora_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -1512,9 +1898,8 @@ def main():
     except Exception:
         pass
 
-    # ----- Eval：按五模式进行最终测试 -----
-    topk = tuple(int(x) for x in args.topk.split(','))
-    metrics = evaluate(model, test_loader, device, pad_id, item_token_ids, topk)
+    # ----- Eval：按模式进行最终测试 -----
+    metrics = evaluate(model, test_loader, device, pad_id, item_token_ids, topk_tuple)
     pretty = ' '.join([f"{k}:{v:.4f}" for k,v in sorted(metrics.items())])
     print(f"[T][{args.mode}] {pretty}")
 
