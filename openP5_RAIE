@@ -13,6 +13,7 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
@@ -428,6 +429,60 @@ def evaluate_causal(model, loader, device, item_final_token_ids: List[int], k_li
         N += int(inp.size(0))
     return {k: (v / max(1, N)) for k, v in sums.items()}
 
+
+def _adapter_final_logits_causal(model, adapter_name: str, input_ids: torch.Tensor,
+                                 attention_mask: torch.Tensor, labels: torch.Tensor,
+                                 item_final_token_ids: List[int]):
+    if hasattr(model, "set_adapter"):
+        try:
+            model.set_adapter(adapter_name)
+        except Exception:
+            pass
+    out = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = out.logits  # [B, L, V]
+    rows = torch.arange(input_ids.size(0), device=input_ids.device)
+    last_label_pos = _last_label_pos(labels)
+    query_pos = (last_label_pos - 1).clamp(min=0)
+    logits_q = logits[rows, query_pos, :]
+    V = logits_q.size(-1)
+    mask_vec = torch.full((V,), float('-inf'), device=input_ids.device)
+    mask_vec[item_final_token_ids] = 0.0
+    return logits_q + mask_vec
+
+
+@torch.no_grad()
+def evaluate_lsat_causal(
+    model,
+    loader: DataLoader,
+    device,
+    item_final_token_ids: List[int],
+    long_adapter: str,
+    short_adapter: str,
+    alpha: float = 0.5,
+    k_list=(5, 10, 20),
+):
+    model.eval()
+    alpha = float(max(0.0, min(1.0, alpha)))
+    sums = {f"Recall@{k}": 0.0 for k in k_list} | {f"NDCG@{k}": 0.0 for k in k_list}
+    N = 0
+    for batch in tqdm(loader, desc='Eval-LSAT'):
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        labels = batch['target_item_idx'].to(device, non_blocking=True)
+
+        logits_long = _adapter_final_logits_causal(model, long_adapter, input_ids, attention_mask, batch['labels'].to(device), item_final_token_ids)
+        logits_short = _adapter_final_logits_causal(model, short_adapter, input_ids, attention_mask, batch['labels'].to(device), item_final_token_ids)
+        logits_final = alpha * logits_long + (1.0 - alpha) * logits_short
+
+        item_ids = torch.tensor(item_final_token_ids, device=device)
+        scores = logits_final.index_select(dim=1, index=item_ids)
+        m = recall_ndcg_from_scores(scores, labels, k_list)
+        for k in k_list:
+            sums[f"Recall@{k}"] += m[f"Recall@{k}"] * input_ids.size(0)
+            sums[f"NDCG@{k}"] += m[f"NDCG@{k}"] * input_ids.size(0)
+        N += int(input_ids.size(0))
+    return {k: (v / max(1, N)) for k, v in sums.items()}
+
 def ce_loss_on_items(model, batch, device, item_final_token_ids: List[int], fp16=False):
     inp = batch["input_ids"].to(device, non_blocking=True)
     attn = batch["attention_mask"].to(device, non_blocking=True)
@@ -522,12 +577,54 @@ def sample_negatives(labels: torch.Tensor, n_items: int, device=None):
         out[i] = cand
     return out
 
+def lwf_kd_loss_causal(
+    student,
+    teacher,
+    batch: dict,
+    device,
+    item_final_token_ids: List[int],
+    T: float = 2.0,
+    alpha: float = 0.5,
+    fp16: bool = False,
+):
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+    labels = batch["target_item_idx"].to(device, non_blocking=True)
+    neg_idx = sample_negatives(labels, len(item_final_token_ids), device=device)
+    item_tokens = torch.tensor(item_final_token_ids, device=device)
+    cand_tokens = torch.stack([
+        item_tokens[labels],
+        item_tokens[neg_idx],
+    ], dim=1)
+
+    rows = torch.arange(input_ids.size(0), device=device)
+    last_label_pos = _last_label_pos(batch["labels"].to(device))
+    query_pos = (last_label_pos - 1).clamp(min=0)
+
+    with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
+        with torch.no_grad():
+            t_out = teacher(input_ids=input_ids, attention_mask=attention_mask)
+            t_logits = t_out.logits  # [B, L, V]
+            t_final = t_logits[rows, query_pos, :] / T
+            t_cand = t_final.gather(1, cand_tokens)
+            t_prob = F.softmax(t_cand, dim=-1)
+
+        s_out = student(input_ids=input_ids, attention_mask=attention_mask)
+        s_logits = s_out.logits
+        s_final = s_logits[rows, query_pos, :] / T
+        s_cand = s_final.gather(1, cand_tokens)
+        s_log_prob = F.log_softmax(s_cand, dim=-1)
+
+    kd = F.kl_div(s_log_prob, t_prob, reduction='batchmean') * (T * T)
+    return alpha * kd
+
 def finetune_one_epoch_lora(
     lora_model, finetune_loader, device,
     item_final_token_ids: List[int],
     optimizer, scheduler=None, fp16=False,
     plugin="none", replay_buf: Optional[ReplayBuffer]=None,
-    replay_ratio=0.3, grad_clip=1.0, log_every=100
+    replay_ratio=0.3, grad_clip=1.0, log_every=100,
+    teacher=None, lwf_T: float = 2.0, lwf_alpha: float = 0.5,
 ):
     lora_model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
@@ -539,6 +636,14 @@ def finetune_one_epoch_lora(
             rb = replay_buf.next_batch()
             rloss, _ = ce_loss_on_items(lora_model, rb, device, item_final_token_ids, fp16=fp16)
             tot = (1.0 - replay_ratio) * tot + replay_ratio * rloss
+
+        kd_loss = torch.tensor(0.0, device=device)
+        if (plugin.find("lwf") >= 0) and (teacher is not None):
+            kd_loss = lwf_kd_loss_causal(
+                lora_model, teacher, batch, device, item_final_token_ids,
+                T=lwf_T, alpha=lwf_alpha, fp16=fp16
+            )
+            tot = tot + kd_loss
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -556,8 +661,130 @@ def finetune_one_epoch_lora(
 
         total += float(tot.detach().item()); nstep += 1
         if (log_every > 0) and (step % log_every == 0):
-            print(f"[F] step={step} loss={float(tot.detach().item()):.4f}")
+            print(f"[F] step={step} loss={float(tot.detach().item()):.4f} kd={float(kd_loss.detach().item()):.4f}")
     return total / max(1, nstep)
+
+
+class _MoLEOutput:
+    def __init__(self, logits, loss=None, gate=None):
+        self.logits = logits
+        self.loss = loss
+        self.gate = gate
+
+
+class MoLEMixtureCausal(nn.Module):
+    def __init__(
+        self,
+        base_model,
+        adapter_names: List[str],
+        item_final_token_ids: List[int],
+        gating_hidden: int = 128,
+        temperature: float = 0.7,
+        balance_coef: float = 0.01,
+    ):
+        super().__init__()
+        self.model = base_model
+        self.adapter_names = adapter_names
+        self.item_final_token_ids = item_final_token_ids
+        self.temperature = temperature
+        self.balance_coef = balance_coef
+
+        H = getattr(base_model.config, "hidden_size", None)
+        if H is None:
+            H = getattr(base_model.config, "d_model", 768)
+        self.gate = nn.Sequential(
+            nn.Linear(H, gating_hidden),
+            nn.Tanh(),
+            nn.Linear(gating_hidden, len(adapter_names))
+        )
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        with torch.set_grad_enabled(self.training):
+            emb = self.model.get_input_embeddings()(input_ids)
+            mask = attention_mask.unsqueeze(-1)
+            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            gate_logits = self.gate(pooled) / self.temperature
+            gate_weights = F.softmax(gate_logits, dim=-1)
+
+        logits_list = []
+        for name in self.adapter_names:
+            if hasattr(self.model, "set_adapter"):
+                try:
+                    self.model.set_adapter(name)
+                except Exception:
+                    pass
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            logits_list.append(out.logits)
+
+        logits_stack = torch.stack(logits_list, dim=1)  # [B, E, L, V]
+        mix_logits = torch.einsum('be,belv->blv', gate_weights, logits_stack)
+
+        loss = None
+        if labels is not None:
+            rows = torch.arange(input_ids.size(0), device=input_ids.device)
+            last_label_pos = _last_label_pos(labels)
+            query_pos = (last_label_pos - 1).clamp(min=0)
+            logits_q = mix_logits[rows, query_pos, :]
+
+            V = logits_q.size(-1)
+            mask_vec = torch.full((V,), float('-inf'), device=input_ids.device)
+            mask_vec[self.item_final_token_ids] = 0.0
+            logits_q = logits_q + mask_vec
+
+            base_loss = F.cross_entropy(logits_q, labels)
+            balance_loss = torch.tensor(0.0, device=input_ids.device)
+            if self.balance_coef > 0:
+                avg_gate = gate_weights.mean(dim=0)
+                uniform = torch.full_like(avg_gate, 1.0 / len(self.adapter_names))
+                balance_loss = self.balance_coef * F.kl_div((avg_gate + 1e-8).log(), uniform, reduction='batchmean')
+            loss = base_loss + balance_loss
+
+        return _MoLEOutput(logits=mix_logits, loss=loss, gate=gate_weights)
+
+
+def finetune_one_epoch_mole(
+    mole_model: MoLEMixtureCausal,
+    finetune_loader: DataLoader,
+    optimizer,
+    scheduler,
+    device,
+    grad_clip: float = 1.0,
+    fp16: bool = False,
+    log_every: int = 100,
+):
+    mole_model.train()
+    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    total_loss, n_steps = 0.0, 0
+    for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
+            out = mole_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = out.loss
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(mole_model.parameters(), grad_clip)
+            scaler.step(optimizer); scaler.update()
+        else:
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(mole_model.parameters(), grad_clip)
+            optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += float(loss.detach().item())
+        n_steps += 1
+        if (log_every > 0) and (step % log_every == 0):
+            print(f"[MoLE] step={step} loss={float(loss.detach().item()):.4f}")
+
+    return total_loss / max(1, n_steps)
 
 # =========================================================
 # ================ RAIE ===================================
@@ -1618,6 +1845,292 @@ def stage_replay(args, device, is_distributed, local_rank, is_main, load_dtype):
     _free_cuda(rep_model)
     if is_distributed: dist.barrier()
 
+def stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype):
+    base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"[stage lwf] base_with_new_tokens not found at {base_dir}")
+    default_dir = os.path.join(args.output_dir, "default")
+    if not os.path.isdir(default_dir):
+        raise FileNotFoundError(f"[stage lwf] default adapter dir not found at {default_dir}")
+
+    tok_lwf, lwf_model = fresh_lora_model_from_base(
+        base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
+    )
+    lwf_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+    lwf_model.set_adapter("default")
+
+    mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
+    ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_lwf, mid2idx, n_items)
+    pad_id = tok_lwf.pad_token_id
+    collate = lambda batch: collate_batch(batch, pad_id)
+    item_final_token_ids = [tok_lwf.convert_tokens_to_ids(t) for t in final_item_tokens]
+
+    if is_distributed:
+        lwf_model = torch.nn.parallel.DistributedDataParallel(
+            lwf_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False
+        )
+    base_eval_model = lwf_model.module if hasattr(lwf_model, "module") else lwf_model
+
+    ft_sampler = DistributedSampler(ds_F, num_replicas=(dist.get_world_size() if is_distributed else 1),
+                                    rank=(dist.get_rank() if is_distributed else 0), shuffle=True) if is_distributed else None
+    ld_F_ddp = DataLoader(ds_F, batch_size=args.finetune_batch_size,
+                          shuffle=(ft_sampler is None), sampler=ft_sampler,
+                          num_workers=2, pin_memory=True, collate_fn=collate)
+
+    ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+    ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+
+    teacher = AutoModelForCausalLM.from_pretrained(base_dir, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+    if hasattr(teacher.config, "use_cache"):
+        teacher.config.use_cache = False
+    teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    FT_optim = torch.optim.AdamW([p for p in lwf_model.parameters() if p.requires_grad], lr=args.lr)
+    FT_sched = get_linear_schedule_with_warmup(FT_optim, int(args.warmup_ratio*len(ld_F_ddp)*max(1,args.finetune_epochs)),
+                                               len(ld_F_ddp)*max(1,args.finetune_epochs))
+
+    for ep in range(1, args.finetune_epochs + 1):
+        if is_distributed and ft_sampler is not None: ft_sampler.set_epoch(ep)
+        loss = finetune_one_epoch_lora(
+            lwf_model, ld_F_ddp, device, item_final_token_ids,
+            optimizer=FT_optim, scheduler=FT_sched, fp16=args.fp16,
+            plugin="lwf", replay_buf=None, replay_ratio=0.0, grad_clip=1.0, log_every=100,
+            teacher=teacher, lwf_T=args.lwf_T, lwf_alpha=args.lwf_alpha,
+        )
+        if is_main: print(f"[Method: LoRA+LwF] F epoch={ep} loss={loss:.4f}")
+
+    if is_main:
+        k_list = sorted(set(args.topk))
+        mO = evaluate_causal(base_eval_model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-O(lora_lwf)")
+        mT = evaluate_causal(base_eval_model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-T(lora_lwf)")
+        with open(os.path.join(args.output_dir, "metrics_original_lora_lwf.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_test_lora_lwf.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
+        save_lora = os.path.join(args.output_dir, "lora_adapter_lora_lwf"); ensure_dir(save_lora); base_eval_model.save_pretrained(save_lora)
+        print("[Done] LoRA+LwF:", mO, mT)
+
+    try:
+        del FT_optim, FT_sched, teacher
+    except Exception:
+        pass
+    _free_cuda(lwf_model)
+    _free_cuda(teacher)
+    if is_distributed: dist.barrier()
+
+def stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype):
+    base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"[stage lsat] base_with_new_tokens not found at {base_dir}")
+    default_dir = os.path.join(args.output_dir, "default")
+    if not os.path.isdir(default_dir):
+        raise FileNotFoundError(f"[stage lsat] default adapter dir not found at {default_dir}")
+
+    tok_lsat, lsat_model = fresh_lora_model_from_base(
+        base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
+    )
+    lsat_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+    lsat_model.set_adapter("default")
+
+    lcfg = LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        bias="none", task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+    )
+    if "short_term" not in getattr(lsat_model, "peft_config", {}):
+        lsat_model.add_adapter("short_term", lcfg)
+
+    mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
+    ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_lsat, mid2idx, n_items)
+    pad_id = tok_lsat.pad_token_id
+    collate = lambda batch: collate_batch(batch, pad_id)
+    item_final_token_ids = [tok_lsat.convert_tokens_to_ids(t) for t in final_item_tokens]
+
+    if is_distributed:
+        lsat_model = torch.nn.parallel.DistributedDataParallel(
+            lsat_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False
+        )
+    base_eval_model = lsat_model.module if hasattr(lsat_model, "module") else lsat_model
+
+    train_sampler = DistributedSampler(ds_trainO, num_replicas=(dist.get_world_size() if is_distributed else 1),
+                                       rank=(dist.get_rank() if is_distributed else 0), shuffle=True) if is_distributed else None
+    train_loader = DataLoader(ds_trainO, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler,
+                              num_workers=2, pin_memory=True, collate_fn=collate)
+
+    ft_sampler = DistributedSampler(ds_F, num_replicas=(dist.get_world_size() if is_distributed else 1),
+                                    rank=(dist.get_rank() if is_distributed else 0), shuffle=True) if is_distributed else None
+    ld_F_ddp = DataLoader(ds_F, batch_size=args.finetune_batch_size,
+                          shuffle=(ft_sampler is None), sampler=ft_sampler,
+                          num_workers=2, pin_memory=True, collate_fn=collate)
+
+    ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+    ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+
+    if hasattr(lsat_model, "set_adapter"):
+        try:
+            lsat_model.set_adapter("default")
+            if hasattr(lsat_model, "train_adapter"):
+                lsat_model.train_adapter("default")
+        except Exception:
+            pass
+
+    long_optim = torch.optim.AdamW([p for p in lsat_model.parameters() if p.requires_grad], lr=args.lr)
+    long_sched = get_linear_schedule_with_warmup(long_optim, int(args.warmup_ratio*len(train_loader)*max(1,args.lsat_long_epochs)),
+                                                 len(train_loader)*max(1,args.lsat_long_epochs))
+    for ep in range(1, args.lsat_long_epochs + 1):
+        if is_distributed and train_sampler is not None: train_sampler.set_epoch(ep)
+        loss = train_one_epoch(lsat_model, train_loader, long_optim, long_sched, device,
+                               item_final_token_ids=item_final_token_ids, fp16=args.fp16, is_main=is_main, grad_clip=args.grad_clip)
+        if is_main: print(f"[LSAT][Long] epoch={ep} loss={loss:.4f}")
+
+    if hasattr(lsat_model, "set_adapter"):
+        try:
+            lsat_model.set_adapter("short_term")
+            if hasattr(lsat_model, "train_adapter"):
+                lsat_model.train_adapter("short_term")
+        except Exception:
+            pass
+
+    short_optim = torch.optim.AdamW([p for p in lsat_model.parameters() if p.requires_grad], lr=args.lr)
+    short_sched = get_linear_schedule_with_warmup(short_optim, int(args.warmup_ratio*len(ld_F_ddp)*max(1,args.lsat_short_epochs)),
+                                                  len(ld_F_ddp)*max(1,args.lsat_short_epochs))
+    for ep in range(1, args.lsat_short_epochs + 1):
+        if is_distributed and ft_sampler is not None: ft_sampler.set_epoch(ep)
+        loss = finetune_one_epoch_lora(
+            lsat_model, ld_F_ddp, device, item_final_token_ids,
+            optimizer=short_optim, scheduler=short_sched, fp16=args.fp16,
+            plugin="none", replay_buf=None, replay_ratio=0.0, grad_clip=1.0, log_every=100
+        )
+        if is_main: print(f"[LSAT][Short] epoch={ep} loss={loss:.4f}")
+
+    if is_main:
+        k_list = sorted(set(args.topk))
+        mO = evaluate_lsat_causal(base_eval_model, ld_O, device, item_final_token_ids, long_adapter="default", short_adapter="short_term", alpha=args.lsat_alpha, k_list=k_list)
+        mT = evaluate_lsat_causal(base_eval_model, ld_T, device, item_final_token_ids, long_adapter="default", short_adapter="short_term", alpha=args.lsat_alpha, k_list=k_list)
+        with open(os.path.join(args.output_dir, "metrics_original_lsat.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_test_lsat.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
+        long_dir = os.path.join(args.output_dir, "lora_adapter_lsat_long"); ensure_dir(long_dir); base_eval_model.save_pretrained(long_dir, selected_adapters=["default"])
+        short_dir = os.path.join(args.output_dir, "lora_adapter_lsat_short"); ensure_dir(short_dir); base_eval_model.save_pretrained(short_dir, selected_adapters=["short_term"])
+        print("[Done] LSAT:", mO, mT)
+
+    try:
+        del long_optim, long_sched, short_optim, short_sched
+    except Exception:
+        pass
+    _free_cuda(lsat_model)
+    if is_distributed: dist.barrier()
+
+def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
+    base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"[stage mole] base_with_new_tokens not found at {base_dir}")
+    default_dir = os.path.join(args.output_dir, "default")
+    if not os.path.isdir(default_dir):
+        raise FileNotFoundError(f"[stage mole] default adapter dir not found at {default_dir}")
+
+    tok_mole, lora_model = fresh_lora_model_from_base(
+        base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
+    )
+    lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+
+    lcfg = LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        bias="none", task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+    )
+
+    adapter_names = []
+    num_exp = max(1, args.mole_num_experts)
+    for i in range(num_exp):
+        name = "default" if i == 0 else f"expert_{i}"
+        adapter_names.append(name)
+        if name not in getattr(lora_model, "peft_config", {}):
+            lora_model.add_adapter(name, lcfg)
+        if hasattr(lora_model, "train_adapter"):
+            try:
+                lora_model.train_adapter(name)
+            except Exception:
+                pass
+
+    mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
+    ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_mole, mid2idx, n_items)
+    pad_id = tok_mole.pad_token_id
+    collate = lambda batch: collate_batch(batch, pad_id)
+    item_final_token_ids = [tok_mole.convert_tokens_to_ids(t) for t in final_item_tokens]
+
+    if is_distributed:
+        lora_model = torch.nn.parallel.DistributedDataParallel(
+            lora_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False
+        )
+
+    ft_sampler = DistributedSampler(ds_F, num_replicas=(dist.get_world_size() if is_distributed else 1),
+                                    rank=(dist.get_rank() if is_distributed else 0), shuffle=True) if is_distributed else None
+    ld_F_ddp = DataLoader(ds_F, batch_size=args.finetune_batch_size,
+                          shuffle=(ft_sampler is None), sampler=ft_sampler,
+                          num_workers=2, pin_memory=True, collate_fn=collate)
+
+    ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+    ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+
+    mole_model = MoLEMixtureCausal(
+        base_model=lora_model,
+        adapter_names=adapter_names,
+        item_final_token_ids=item_final_token_ids,
+        gating_hidden=args.mole_gating_hidden,
+        temperature=args.mole_temp,
+        balance_coef=args.mole_balance,
+    ).to(device)
+
+    if is_distributed:
+        mole_model = torch.nn.parallel.DistributedDataParallel(
+            mole_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=False
+        )
+    base_eval_model = mole_model.module if hasattr(mole_model, "module") else mole_model
+
+    no_decay = ['bias', 'LayerNorm.weight']
+    params = [
+        {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
+        {"params": [p for n, p in mole_model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+    ]
+    FT_optim = torch.optim.AdamW(params, lr=args.lr)
+    FT_sched = get_linear_schedule_with_warmup(FT_optim, int(args.warmup_ratio*len(ld_F_ddp)*max(1,args.finetune_epochs)),
+                                               len(ld_F_ddp)*max(1,args.finetune_epochs))
+
+    for ep in range(1, args.finetune_epochs + 1):
+        if is_distributed and ft_sampler is not None: ft_sampler.set_epoch(ep)
+        loss = finetune_one_epoch_mole(
+            mole_model, ld_F_ddp, FT_optim, FT_sched, device,
+            grad_clip=1.0, fp16=args.fp16, log_every=100
+        )
+        if is_main: print(f"[MoLE] epoch={ep} loss={loss:.4f}")
+
+    if is_main:
+        k_list = sorted(set(args.topk))
+        mO = evaluate_causal(base_eval_model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-O(mole)")
+        mT = evaluate_causal(base_eval_model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-T(mole)")
+        with open(os.path.join(args.output_dir, "metrics_original_mole.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_test_mole.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
+        adapter_dir = os.path.join(args.output_dir, "mole_adapters"); ensure_dir(adapter_dir); lora_model.save_pretrained(adapter_dir, selected_adapters=adapter_names)
+        torch.save({
+            'gate_state': base_eval_model.gate.state_dict(),
+            'adapter_names': adapter_names,
+            'temperature': args.mole_temp,
+            'balance_coef': args.mole_balance,
+        }, os.path.join(adapter_dir, 'mole_gate.pt'))
+        print("[Done] MoLE:", mO, mT)
+
+    try:
+        del FT_optim, FT_sched
+    except Exception:
+        pass
+    _free_cuda(mole_model)
+    if is_distributed: dist.barrier()
+
 def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
     if not os.path.isdir(base_dir):
@@ -1772,7 +2285,7 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
     # 新增：阶段控制
-    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','raie'], default='raie',
+    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='raie',
                     help='选择运行阶段')
     ap.add_argument('--resume_base_dir', type=str, default='',
                     help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
@@ -1811,6 +2324,15 @@ def main():
     # Replay
     ap.add_argument('--replay_ratio', type=float, default=0.3)
 
+    # LwF
+    ap.add_argument('--lwf_T', type=float, default=2.0)
+    ap.add_argument('--lwf_alpha', type=float, default=0.5)
+
+    # LSAT
+    ap.add_argument('--lsat_alpha', type=float, default=0.6)
+    ap.add_argument('--lsat_long_epochs', type=int, default=1)
+    ap.add_argument('--lsat_short_epochs', type=int, default=3)
+
     # RAIE
     ap.add_argument("--K", type=int, default=3)
     ap.add_argument("--q", type=float, default=0.9)
@@ -1821,6 +2343,12 @@ def main():
     ap.add_argument("--soft_rep_factor", type=int, default=2)
     ap.add_argument("--raie_epochs_per_region", type=int, default=3)
     ap.add_argument("--lambda_anchor", type=float, default=1e-4)
+
+    # MoLE
+    ap.add_argument('--mole_num_experts', type=int, default=4)
+    ap.add_argument('--mole_gating_hidden', type=int, default=128)
+    ap.add_argument('--mole_temp', type=float, default=0.7)
+    ap.add_argument('--mole_balance', type=float, default=0.01)
 
     args = ap.parse_args()
 
@@ -1860,6 +2388,15 @@ def main():
 
     if args.stage in ("all", "replay"):
         stage_replay(args, device, is_distributed, local_rank, is_main, load_dtype)
+
+    if args.stage in ("all", "lwf"):
+        stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype)
+
+    if args.stage in ("all", "lsat"):
+        stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype)
+
+    if args.stage in ("all", "mole"):
+        stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype)
 
     if args.stage in ("all", "raie"):
         if is_distributed and rank != 0:
