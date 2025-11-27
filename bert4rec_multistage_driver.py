@@ -1,26 +1,3 @@
-"""
-Multi-stage fine-tuning / evaluation driver for Bert4Rec_RAIE.
-
-Workflow
---------
-1) Train on ``original_stream.jsonl`` once to obtain a base model.
-2) Iteratively fine-tune on f1, f2, f3, f4 (or any provided stages).
-   After each fine-tune step it evaluates two targets:
-     - The *next* stage (e.g., after f1 tuning, evaluate on f2).
-     - The historical ``original`` split to measure preference retention.
-
-It reuses the training / finetuning helpers defined in ``Bert4Rec_RAIE``
-without modifying that file. All modes supported by ``Bert4Rec_RAIE``
-(``base``, ``lora``, ``lora_replay``, ``lora_lwf``, ``lsat``, ``raie``,
-``mole``) are available.
-
-Example:
-    python bert4rec_multistage_driver.py \
-        --data_dir /path/to/ml-10M100K \
-        --output_dir ./runs/multistage_lora \
-        --mode lora --stages f1,f2,f3,f4 --pred_stages f2,f3,f4,test
-"""
-
 import argparse
 import importlib.util
 import json
@@ -39,7 +16,7 @@ from transformers import BertConfig, BertForMaskedLM, get_linear_schedule_with_w
 # -----------------------------------------------
 
 def _load_bert4rec_module(path: str) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("bert4rec_raie", path)
+    spec = importlib.util.spec_from_file_location("Bert4Rec_RAIE_ALL_NEW.py", path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise ImportError(f"Cannot load module from {path}")
     mod = importlib.util.module_from_spec(spec)
@@ -61,7 +38,7 @@ class MultiStageRunner:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.module = _load_bert4rec_module(os.path.join(os.path.dirname(__file__), "Bert4Rec_RAIE"))
+        self.module = _load_bert4rec_module(os.path.join(os.path.dirname(__file__), "Bert4Rec_RAIE_ALL_NEW.py"))
 
         # shared vocab + collators
         self.token2id, self.id2token, self.item_token_ids = self.module.load_item_vocab(args.data_dir)
@@ -403,8 +380,8 @@ class MultiStageRunner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-stage runner for Bert4Rec_RAIE")
-    p.add_argument("--data_dir", type=str, required=True)
-    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--data_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
+    p.add_argument("--output_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
     p.add_argument("--mode", type=str, default="lora", choices=[
         "base",
         "lora",
@@ -427,13 +404,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_prob", type=float, default=0.15)
 
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
-    p.add_argument("--finetune_epochs", type=int, default=2)
+    p.add_argument("--finetune_epochs", type=int, default=3)
     p.add_argument("--finetune_batch_size", type=int, default=32)
     p.add_argument("--finetune_lr", type=float, default=5e-4)
     p.add_argument("--do_prompt_mask", action="store_true")
@@ -455,7 +432,7 @@ def parse_args() -> argparse.Namespace:
         default="query, key, value, intermediate.dense, output.dense, attention.output.dense",
     )
 
-    p.add_argument("--mole_num_experts", type=int, default=4)
+    p.add_argument("--mole_num_experts", type=int, default=3)
     p.add_argument("--mole_gating_hidden", type=int, default=128)
     p.add_argument("--mole_temp", type=float, default=0.7)
     p.add_argument("--mole_balance", type=float, default=0.01)
