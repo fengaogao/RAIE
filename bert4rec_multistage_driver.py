@@ -199,6 +199,47 @@ class MultiStageRunner:
             collate_fn=self.eval_collator,
         )
 
+        if not ft_stages:
+            raise ValueError("--stages must not be empty")
+
+        initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
+        if not os.path.exists(initial_pred_path):
+            raise FileNotFoundError(initial_pred_path)
+        initial_pred_loader = DataLoader(
+            self.module.NextItemDataset(initial_pred_path),
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            collate_fn=self.eval_collator,
+        )
+
+        initial_predict_metrics = self.module.evaluate(
+            base_model,
+            initial_pred_loader,
+            self.device,
+            self.item_token_ids,
+            topk=tuple(int(x) for x in self.args.topk.split(",")),
+        )
+        initial_original_metrics = self.module.evaluate(
+            base_model,
+            original_loader,
+            self.device,
+            self.item_token_ids,
+            topk=tuple(int(x) for x in self.args.topk.split(",")),
+        )
+
+        results.append(
+            StageResult(
+                finetune_stage="original_stream",
+                predict_stage=ft_stages[0],
+                predict_metrics=initial_predict_metrics,
+                original_metrics=initial_original_metrics,
+                model_dir=base_dir,
+            )
+        )
+        print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
+        print(f"[Eval][original_stream->original] {initial_original_metrics}")
+
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
