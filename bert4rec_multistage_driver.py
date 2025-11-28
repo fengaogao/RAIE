@@ -853,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-stage runner for Bert4Rec_RAIE")
     p.add_argument("--data_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
     p.add_argument("--output_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
-    p.add_argument("--mode", type=str, default="lora", choices=[
+    p.add_argument("--mode", type=str, default="base", choices=[
         "base",
         "lora",
         "lora_replay",
