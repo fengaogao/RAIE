@@ -5,7 +5,7 @@ import os
 import types
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
-
+import shutil
 import torch
 from torch.utils.data import DataLoader
 from transformers import BertConfig, BertForMaskedLM, get_linear_schedule_with_warmup
@@ -180,6 +180,8 @@ class MultiStageRunner:
         base_model = self._init_base_model()
         self._train_on_stream(base_model)
         base_dir = os.path.join(self.args.output_dir, "base_model")
+        if os.path.isdir(base_dir):
+            shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
         base_model.save_pretrained(base_dir)
         with open(os.path.join(base_dir, "vocab.json"), "w", encoding="utf-8") as f:
@@ -273,6 +275,8 @@ class MultiStageRunner:
             )
 
             stage_dir = os.path.join(self.args.output_dir, f"stage_{ft_name}")
+            if os.path.isdir(stage_dir):
+                shutil.rmtree(stage_dir)
             os.makedirs(stage_dir, exist_ok=True)
 
             if self.args.mode == "base":
@@ -853,7 +857,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-stage runner for Bert4Rec_RAIE")
     p.add_argument("--data_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
     p.add_argument("--output_dir", type=str, default="/home/zj/code/ml-10M100K_multistage")
-    p.add_argument("--mode", type=str, default="base", choices=[
+    p.add_argument("--mode", type=str, default="mole", choices=[
         "base",
         "lora",
         "lora_replay",
@@ -908,7 +912,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mole_temp", type=float, default=0.7)
     p.add_argument("--mole_balance", type=float, default=0.01)
 
-    p.add_argument("--K", type=int, default=10)
+    p.add_argument("--K", type=int, default=3)
     p.add_argument("--q", type=float, default=0.9)
     p.add_argument("--T_low", type=float, default=0.7)
     p.add_argument("--T_high", type=float, default=0.9)
