@@ -509,7 +509,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
                     label_smoothing: float = 0.0):
     model.train()
     total = 0.0
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=fp16 and torch.cuda.is_available())
     item_ids = torch.tensor(item_final_token_ids, device=device)
 
     for batch in tqdm(dataloader, desc="Train(O)", disable=not is_main):
@@ -627,7 +627,7 @@ def finetune_one_epoch_lora(
     teacher=None, lwf_T: float = 2.0, lwf_alpha: float = 0.5,
 ):
     lora_model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=fp16 and torch.cuda.is_available())
     total, nstep = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc=f"Finetune(F)-{plugin}"), start=1):
         loss, _ = ce_loss_on_items(lora_model, batch, device, item_final_token_ids, fp16=fp16)
@@ -738,9 +738,9 @@ class MoLEMixtureCausal(nn.Module):
             base_loss = F.cross_entropy(logits_q, target_labels)
             balance_loss = torch.tensor(0.0, device=input_ids.device)
             if self.balance_coef > 0:
-                avg_gate = gate_weights.mean(dim=0)
+                avg_gate = gate_weights.mean(dim=0).clamp(min=1e-6)
                 uniform = torch.full_like(avg_gate, 1.0 / len(self.adapter_names))
-                balance_loss = self.balance_coef * F.kl_div((avg_gate + 1e-8).log(), uniform, reduction='batchmean')
+                balance_loss = self.balance_coef * F.kl_div(avg_gate.log(), uniform, reduction='batchmean')
             loss = base_loss + balance_loss
 
         return _MoLEOutput(logits=mix_logits, loss=loss, gate=gate_weights)
@@ -757,7 +757,7 @@ def finetune_one_epoch_mole(
     log_every: int = 100,
 ):
     mole_model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=fp16 and torch.cuda.is_available())
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
         input_ids = batch['input_ids'].to(device, non_blocking=True)
@@ -768,6 +768,10 @@ def finetune_one_epoch_mole(
         with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
             out = mole_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = out.loss
+
+        if not torch.isfinite(loss):
+            print(f"[MoLE] step={step} loss became non-finite; skipping update")
+            continue
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -873,7 +877,7 @@ def finetune_one_epoch_causal_anchor(
     嵌入正则/Hook 在 embed_model（unwrap 后模块）上做。
     """
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=fp16 and torch.cuda.is_available())
     total, nstep = 0.0, 0
     for batch in tqdm(finetune_loader, desc="Finetune(F)-Anchor"):
         loss, _ = ce_loss_on_items(model, batch, device, item_final_token_ids, fp16=fp16)
