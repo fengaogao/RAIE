@@ -683,15 +683,16 @@ class MoLEMixtureCausal(nn.Module):
         balance_coef: float = 0.01,
     ):
         super().__init__()
-        self.model = base_model
+        self.model = base_model.module if hasattr(base_model, "module") else base_model
         self.adapter_names = adapter_names
         self.item_final_token_ids = item_final_token_ids
         self.temperature = temperature
         self.balance_coef = balance_coef
 
-        H = getattr(base_model.config, "hidden_size", None)
+        config = getattr(self.model, "config", None)
+        H = getattr(config, "hidden_size", None) if config is not None else None
         if H is None:
-            H = getattr(base_model.config, "d_model", 768)
+            H = getattr(config, "d_model", 768) if config is not None else 768
         self.gate = nn.Sequential(
             nn.Linear(H, gating_hidden),
             nn.Tanh(),
@@ -727,12 +728,14 @@ class MoLEMixtureCausal(nn.Module):
             query_pos = (last_label_pos - 1).clamp(min=0)
             logits_q = mix_logits[rows, query_pos, :]
 
+            target_labels = labels[rows, last_label_pos]
+
             V = logits_q.size(-1)
             mask_vec = torch.full((V,), float('-inf'), device=input_ids.device)
             mask_vec[self.item_final_token_ids] = 0.0
             logits_q = logits_q + mask_vec
 
-            base_loss = F.cross_entropy(logits_q, labels)
+            base_loss = F.cross_entropy(logits_q, target_labels)
             balance_loss = torch.tensor(0.0, device=input_ids.device)
             if self.balance_coef > 0:
                 avg_gate = gate_weights.mean(dim=0)
@@ -2276,8 +2279,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
-    ap.add_argument('--output_dir', type=str, default='./runs/openP5_ml10M100K')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/')
+    ap.add_argument('--output_dir', type=str, default='./runs/openP5_yelp')
 
     ap.add_argument('--train_jsonl_path', type=str, default='')
     ap.add_argument('--original_jsonl_path', type=str, default='')
