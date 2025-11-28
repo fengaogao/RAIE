@@ -2042,7 +2042,8 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
     tok_mole, lora_model = fresh_lora_model_from_base(
         base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
     )
-    lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+    # 默认适配器作为稳定基线，不应在 MoLE 阶段继续更新
+    lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=False)
 
     lcfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -2057,7 +2058,8 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
         adapter_names.append(name)
         if name not in getattr(lora_model, "peft_config", {}):
             lora_model.add_adapter(name, lcfg)
-        if hasattr(lora_model, "train_adapter"):
+        # 仅训练新建的专家适配器，避免污染 default
+        if (name != "default") and hasattr(lora_model, "train_adapter"):
             try:
                 lora_model.train_adapter(name)
             except Exception:
