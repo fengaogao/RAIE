@@ -772,6 +772,13 @@ def finetune_one_epoch_mole(
         with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
             out = mole_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = out.loss
+            # ===== [DBG-Y] find the first step that corrupts default adapter =====
+            if (loss is None) or (not torch.isfinite(loss)):
+                print(f"[DBG-Y][NON-FINITE LOSS] step={step} loss={loss}")
+
+            # 额外：如果 forward 的 mix_logits 已经非有限，也跳过
+            if not torch.isfinite(out.logits).all():
+                print(f"[DBG-Y][NON-FINITE MIX_LOGITS] step={step}")
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -2042,7 +2049,6 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
     tok_mole, lora_model = fresh_lora_model_from_base(
         base_dir, device, args.lora_r, args.lora_alpha, args.lora_dropout, load_dtype
     )
-    # 默认适配器作为稳定基线，不应在 MoLE 阶段继续更新
     lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=False)
 
     lcfg = LoraConfig(
@@ -2058,12 +2064,29 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
         adapter_names.append(name)
         if name not in getattr(lora_model, "peft_config", {}):
             lora_model.add_adapter(name, lcfg)
-        # 仅训练新建的专家适配器，避免污染 default
         if (name != "default") and hasattr(lora_model, "train_adapter"):
             try:
                 lora_model.train_adapter(name)
             except Exception:
                 pass
+    base_peft = lora_model.module if hasattr(lora_model, "module") else lora_model
+
+    def _is_lora_param(n: str) -> bool:
+        return ("lora_" in n) or (".lora_" in n)
+
+    for n, p in base_peft.named_parameters():
+        if _is_lora_param(n) and ".default." in n:
+            p.requires_grad_(False)
+
+    for n, p in base_peft.named_parameters():
+        if not _is_lora_param(n):
+            continue
+        for name in adapter_names:
+            if name == "default":
+                continue
+            if f".{name}." in n:
+                p.requires_grad_(True)
+                break
 
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_mole, mid2idx, n_items)
