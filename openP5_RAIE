@@ -95,6 +95,24 @@ def set_seed(seed: int = 42, rank: int = 0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def amp_enabled_for_model(model: nn.Module, fp16_flag: bool) -> bool:
+    """Return True when AMP+GradScaler should be used.
+
+    GradScaler expects FP32/BF16 gradients; when models are loaded directly in
+    FP16 to save memory, gradients will also be FP16 and GradScaler raises
+    "Attempting to unscale FP16 gradients.". Enable AMP only when trainable
+    parameters keep higher precision copies.
+    """
+    if not (fp16_flag and torch.cuda.is_available()):
+        return False
+    try:
+        for p in model.parameters():
+            if p.requires_grad and p.dtype in (torch.float32, torch.bfloat16):
+                return True
+    except Exception:
+        pass
+    return False
+
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
@@ -509,14 +527,15 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
                     label_smoothing: float = 0.0):
     model.train()
     total = 0.0
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    use_amp = amp_enabled_for_model(model, fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     item_ids = torch.tensor(item_final_token_ids, device=device)
 
     for batch in tqdm(dataloader, desc="Train(O)", disable=not is_main):
         for k in batch:
             batch[k] = batch[k].to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
             logits = out.logits
             last_label_pos = _last_label_pos(batch["labels"])
@@ -627,21 +646,22 @@ def finetune_one_epoch_lora(
     teacher=None, lwf_T: float = 2.0, lwf_alpha: float = 0.5,
 ):
     lora_model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    use_amp = amp_enabled_for_model(lora_model, fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc=f"Finetune(F)-{plugin}"), start=1):
-        loss, _ = ce_loss_on_items(lora_model, batch, device, item_final_token_ids, fp16=fp16)
+        loss, _ = ce_loss_on_items(lora_model, batch, device, item_final_token_ids, fp16=use_amp)
         tot = loss
         if (plugin.find("replay") >= 0) and (replay_buf is not None) and (replay_ratio > 0):
             rb = replay_buf.next_batch()
-            rloss, _ = ce_loss_on_items(lora_model, rb, device, item_final_token_ids, fp16=fp16)
+            rloss, _ = ce_loss_on_items(lora_model, rb, device, item_final_token_ids, fp16=use_amp)
             tot = (1.0 - replay_ratio) * tot + replay_ratio * rloss
 
         kd_loss = torch.tensor(0.0, device=device)
         if (plugin.find("lwf") >= 0) and (teacher is not None):
             kd_loss = lwf_kd_loss_causal(
                 lora_model, teacher, batch, device, item_final_token_ids,
-                T=lwf_T, alpha=lwf_alpha, fp16=fp16
+                T=lwf_T, alpha=lwf_alpha, fp16=use_amp
             )
             tot = tot + kd_loss
 
@@ -761,7 +781,8 @@ def finetune_one_epoch_mole(
     log_every: int = 100,
 ):
     mole_model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    use_amp = amp_enabled_for_model(mole_model, fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
         input_ids = batch['input_ids'].to(device, non_blocking=True)
@@ -769,7 +790,7 @@ def finetune_one_epoch_mole(
         labels = batch['labels'].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=fp16 and torch.cuda.is_available()):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             out = mole_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = out.loss
             # ===== [DBG-Y] find the first step that corrupts default adapter =====
@@ -884,10 +905,11 @@ def finetune_one_epoch_causal_anchor(
     嵌入正则/Hook 在 embed_model（unwrap 后模块）上做。
     """
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=fp16 and torch.cuda.is_available())
+    use_amp = amp_enabled_for_model(model, fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for batch in tqdm(finetune_loader, desc="Finetune(F)-Anchor"):
-        loss, _ = ce_loss_on_items(model, batch, device, item_final_token_ids, fp16=fp16)
+        loss, _ = ce_loss_on_items(model, batch, device, item_final_token_ids, fp16=use_amp)
         if lambda_anchor > 0.0 and (E0 is not None) and (tune_token_ids is not None) and tune_token_ids.numel()>0:
             m_embed = embed_model if embed_model is not None else model
             Ein = m_embed.get_input_embeddings().weight
