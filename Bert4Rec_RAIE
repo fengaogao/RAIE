@@ -1,5 +1,3 @@
-# raie_bert4rec_five_modes.py
-# -*- coding: utf-8 -*-
 import os, math, json, argparse
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -522,7 +520,8 @@ class MoLEMixture(nn.Module):
         with torch.set_grad_enabled(self.training):
             emb = self.model.get_input_embeddings()(input_ids)
             mask = attention_mask.unsqueeze(-1)
-            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            mask_sum = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+            pooled = (emb * mask).sum(dim=1) / mask_sum  # [B, D]
             gate_logits = self.gate(pooled) / self.temperature
             gate_weights = F.softmax(gate_logits, dim=-1)
 
@@ -1457,12 +1456,12 @@ def evaluate_lsat(
 # =========================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='lora_lwf',
+    parser.add_argument('--mode', type=str, default='mole',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
                         help='7种方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
-    parser.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/',
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/',
                         help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl(or original.jsonl), item_ids.json')
-    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_Amazon_electronics')
+    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_ml-10M100K')
 
     # Sequence / vocab
     parser.add_argument('--max_len', type=int, default=20, help='Length of prompt (without [CLS])')
@@ -1512,7 +1511,7 @@ def main():
                         default='query, key, value, intermediate.dense, output.dense, attention.output.dense')
 
     # MoLE args
-    parser.add_argument('--mole_num_experts', type=int, default=4,
+    parser.add_argument('--mole_num_experts', type=int, default=3,
                         help='Number of LoRA experts to mix (including the default adapter)')
     parser.add_argument('--mole_gating_hidden', type=int, default=128,
                         help='Hidden size of the gating MLP')
@@ -1531,7 +1530,7 @@ def main():
     parser.add_argument('--gap_thr', type=float, default=0.02)
     parser.add_argument('--pool_min', type=int, default=120)
     parser.add_argument('--bic_gain', type=float, default=1e4)
-    parser.add_argument('--orig_mix_ratio', type=float, default=0.3)
+    parser.add_argument('--orig_mix_ratio', type=float, default=0.7)
     parser.add_argument('--soft_rep_factor', type=int, default=2)
 
     parser.add_argument('--topk', type=str, default='5,10,20')
@@ -1601,7 +1600,7 @@ def main():
         attention_probs_dropout_prob=args.dropout,
         pad_token_id=pad_id,
     )
-    device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
     base_model = BertForMaskedLM(config).to(device)
 
     # O-stage optimizer & scheduler
