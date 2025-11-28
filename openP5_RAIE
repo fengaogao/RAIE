@@ -355,7 +355,7 @@ class SeqRecDatasetFromPairs(Dataset):
             answer_text = " ".join(item_token_seq[idx_tgt])
 
             enc_prompt = self.tok(prompt_text, add_special_tokens=True)
-            enc_answer = self.tok(" " + answer_text, add_special_tokens=False)
+            enc_answer = self.tok(answer_text, add_special_tokens=False)
             if len(enc_answer["input_ids"]) == 0:
                 continue
 
@@ -716,6 +716,10 @@ class MoLEMixtureCausal(nn.Module):
                 except Exception:
                     pass
             out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            if not torch.isfinite(out.logits).all():
+                bad = (~torch.isfinite(out.logits)).any().item()
+                if bad:
+                    print(f"[DBG-X][NON-FINITE LOGITS] adapter={name}")
             logits_list.append(out.logits)
 
         logits_stack = torch.stack(logits_list, dim=1)  # [B, E, L, V]
