@@ -4,11 +4,14 @@ import json
 import os
 import types
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 from transformers import BertConfig, BertForMaskedLM, get_linear_schedule_with_warmup
+
+import numpy as np
+from peft import PeftModel
 
 
 # -----------------------------------------------
@@ -106,7 +109,8 @@ class MultiStageRunner:
     # -------------------------
     # Training primitives
     # -------------------------
-    def _train_on_stream(self, model: torch.nn.Module):
+    def _train_on_stream(self, model: torch.nn.Module, epochs: int = None):
+        epochs = self.args.epochs if epochs is None else epochs
         no_decay = ["bias", "LayerNorm.weight"]
         params = [
             {
@@ -119,11 +123,11 @@ class MultiStageRunner:
             },
         ]
         optim = torch.optim.AdamW(params, lr=self.args.lr)
-        total_steps = len(self.train_loader) * max(self.args.epochs, 1)
+        total_steps = len(self.train_loader) * max(epochs, 1)
         sched = get_linear_schedule_with_warmup(
             optim, int(total_steps * self.args.warmup_ratio), total_steps
         )
-        for ep in range(1, self.args.epochs + 1):
+        for ep in range(1, epochs + 1):
             tr = self.module.train_one_epoch(
                 model,
                 self.train_loader,
@@ -173,7 +177,6 @@ class MultiStageRunner:
     # Stage execution
     # -------------------------
     def run(self) -> List[StageResult]:
-        # base training
         base_model = self._init_base_model()
         self._train_on_stream(base_model)
         base_dir = os.path.join(self.args.output_dir, "base_model")
@@ -191,6 +194,7 @@ class MultiStageRunner:
             raise ValueError("--stages and --pred_stages must align")
 
         original_eval_ds = self.module.NextItemDataset(os.path.join(self.args.data_dir, "original.jsonl"))
+        self.original_route_ds = original_eval_ds
         original_loader = DataLoader(
             original_eval_ds,
             batch_size=self.args.batch_size,
@@ -212,15 +216,15 @@ class MultiStageRunner:
             num_workers=2,
             collate_fn=self.eval_collator,
         )
-
-        initial_predict_metrics = self.module.evaluate(
+        base_eval_fn = self.module.evaluate
+        initial_predict_metrics = base_eval_fn(
             base_model,
             initial_pred_loader,
             self.device,
             self.item_token_ids,
             topk=tuple(int(x) for x in self.args.topk.split(",")),
         )
-        initial_original_metrics = self.module.evaluate(
+        initial_original_metrics = base_eval_fn(
             base_model,
             original_loader,
             self.device,
@@ -239,6 +243,8 @@ class MultiStageRunner:
         )
         print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
         print(f"[Eval][original_stream->original] {initial_original_metrics}")
+
+        topk_tuple = tuple(int(x) for x in self.args.topk.split(","))
 
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
@@ -266,38 +272,233 @@ class MultiStageRunner:
                 collate_fn=self.eval_collator,
             )
 
-            model = BertForMaskedLM.from_pretrained(current_model_dir).to(self.device)
-
-            if self.args.mode == "base":
-                self._finetune_base(model, ft_loader)
-                eval_model = model
-            elif self.args.mode in {"lora", "lora_replay", "lora_lwf", "lsat", "raie"}:
-                lora_model = self._apply_lora(model)
-                eval_model = self._finetune_lora_based(lora_model, ft_loader)
-            elif self.args.mode == "mole":
-                eval_model = self._finetune_mole(model, ft_loader)
-            else:  # pragma: no cover - parser guards values
-                raise ValueError(f"Unsupported mode {self.args.mode}")
-
-            predict_metrics = self.module.evaluate(
-                eval_model,
-                pred_loader,
-                self.device,
-                self.item_token_ids,
-                topk=tuple(int(x) for x in self.args.topk.split(",")),
-            )
-            original_metrics = self.module.evaluate(
-                eval_model,
-                original_loader,
-                self.device,
-                self.item_token_ids,
-                topk=tuple(int(x) for x in self.args.topk.split(",")),
-            )
-
             stage_dir = os.path.join(self.args.output_dir, f"stage_{ft_name}")
             os.makedirs(stage_dir, exist_ok=True)
-            eval_model.save_pretrained(stage_dir)
-            current_model_dir = stage_dir
+
+            if self.args.mode == "base":
+                model = BertForMaskedLM.from_pretrained(self._base_path(current_model_dir)).to(self.device)
+                self._finetune_base(model, ft_loader)
+                predict_metrics = self.module.evaluate(
+                    model, pred_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                original_metrics = self.module.evaluate(
+                    model, original_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                model.save_pretrained(stage_dir)
+                current_model_dir = stage_dir
+            elif self.args.mode in {"lora", "lora_replay", "lora_lwf"}:
+                base_model = BertForMaskedLM.from_pretrained(self._base_path(current_model_dir)).to(self.device)
+                lora_model = self._apply_lora(base_model)
+                eval_model = self._finetune_lora_based(lora_model, ft_loader)
+                predict_metrics = self.module.evaluate(
+                    eval_model, pred_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                original_metrics = self.module.evaluate(
+                    eval_model, original_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                eval_model.save_pretrained(stage_dir)
+                current_model_dir = stage_dir
+            elif self.args.mode == "lsat":
+                lora_model, _ = self._load_lsat_model(current_model_dir)
+                eval_model = self._train_lsat_stage(lora_model, ft_loader)
+                predict_metrics = self.module.evaluate_lsat(
+                    eval_model,
+                    pred_loader,
+                    self.device,
+                    self.item_token_ids,
+                    long_adapter="default",
+                    short_adapter="short_term",
+                    alpha=self.args.lsat_alpha,
+                    topk=topk_tuple,
+                )
+                original_metrics = self.module.evaluate_lsat(
+                    eval_model,
+                    original_loader,
+                    self.device,
+                    self.item_token_ids,
+                    long_adapter="default",
+                    short_adapter="short_term",
+                    alpha=self.args.lsat_alpha,
+                    topk=topk_tuple,
+                )
+                self._save_lora_checkpoint(
+                    eval_model, stage_dir, ["default", "short_term"], meta={"mode": "lsat"}
+                )
+                current_model_dir = stage_dir
+            elif self.args.mode == "mole":
+                mole_model, adapter_names = self._load_mole_model(current_model_dir)
+
+                ft_params = [p for p in mole_model.parameters() if p.requires_grad]
+                ft_optim = torch.optim.AdamW(ft_params, lr=self.args.finetune_lr)
+                ft_steps = len(ft_loader) * max(self.args.finetune_epochs, 1)
+                ft_sched = get_linear_schedule_with_warmup(
+                    ft_optim, int(ft_steps * self.args.warmup_ratio), ft_steps
+                )
+                for ep in range(1, self.args.finetune_epochs + 1):
+                    loss = self.module.finetune_one_epoch_mole(
+                        mole_model, ft_loader, ft_optim, ft_sched, self.device, grad_clip=self.args.grad_clip
+                    )
+                    print(f"[MoLE][F][Epoch {ep}] loss={loss:.4f}")
+
+                predict_metrics = self.module.evaluate(
+                    mole_model, pred_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                original_metrics = self.module.evaluate(
+                    mole_model, original_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                self._save_mole_checkpoint(mole_model, stage_dir, adapter_names)
+                current_model_dir = stage_dir
+            elif self.args.mode == "raie":
+                lora_model, adapter_names, _ = self._load_raie_model(current_model_dir)
+
+                emb_in = lora_model.get_input_embeddings()
+                E0 = emb_in.weight.detach().clone()
+                tune_ids = sorted(
+                    {
+                        self.token2id.get(ex.target_token, None)
+                        for ex in ft_ds.examples
+                        if self.token2id.get(ex.target_token, None) in self.item_token_ids
+                    }
+                )
+                ids_t = (
+                    torch.tensor(tune_ids, device=emb_in.weight.device) if len(tune_ids) > 0 else None
+                )
+                lambda_anchor = 1e-4
+
+                emb_in.weight.requires_grad_(True)
+                mask = torch.zeros_like(emb_in.weight, dtype=torch.bool)
+                if len(tune_ids) > 0:
+                    ids = torch.tensor(sorted(tune_ids), device=emb_in.weight.device, dtype=torch.long)
+                    mask[ids] = True
+
+                def grad_mask(g):
+                    return g.masked_fill(~mask, 0)
+
+                emb_in.weight.register_hook(grad_mask)
+                emb_out = lora_model.get_output_embeddings()
+                if emb_out is not None and emb_out.weight is not emb_in.weight:
+                    emb_out.weight.requires_grad_(True)
+                    emb_out.weight.register_hook(grad_mask)
+
+                ft_params = [p for p in lora_model.parameters() if p.requires_grad]
+                ft_optim = torch.optim.AdamW(ft_params, lr=self.args.finetune_lr)
+                ft_steps = len(ft_loader) * max(self.args.finetune_epochs, 1)
+                ft_sched = get_linear_schedule_with_warmup(
+                    ft_optim, int(ft_steps * self.args.warmup_ratio), ft_steps
+                )
+                for ep in range(self.args.finetune_epochs):
+                    ft_loss = self.module.finetune_one_epoch_bert(
+                        lora_model,
+                        ft_loader,
+                        ft_optim,
+                        ft_sched,
+                        self.device,
+                        self.item_token_ids,
+                        grad_clip=self.args.grad_clip,
+                        E0=E0,
+                        ids_t=ids_t,
+                        lambda_anchor=lambda_anchor,
+                    )
+                    print(f"[RAIE][F][Epoch {ep+1}] loss={ft_loss:.4f}")
+
+                emb_in.weight.requires_grad_(False)
+                if emb_out is not None and emb_out.weight is not emb_in.weight:
+                    emb_out.weight.requires_grad_(False)
+
+                default_dir = os.path.join(stage_dir, "default")
+                os.makedirs(default_dir, exist_ok=True)
+                lora_model.save_pretrained(default_dir, selected_adapters=["default"])
+
+                bank = self.module.RegionBank(
+                    model=lora_model,
+                    token2id=self.token2id,
+                    item_token_ids=self.item_token_ids,
+                    pad_id=self.pad_id,
+                    cls_id=self.cls_id,
+                    max_len=self.args.max_len,
+                    device=self.device,
+                    out_dir=stage_dir,
+                    K=self.args.K,
+                    q=self.args.q,
+                    T_low=self.args.T_low,
+                    T_high=self.args.T_high,
+                    tau=self.args.tau,
+                    gamma=self.args.gamma,
+                    gap_thr=self.args.gap_thr,
+                    lora_r=self.args.lora_r,
+                    lora_alpha=self.args.lora_alpha,
+                    lora_dropout=self.args.lora_dropout,
+                    target_modules=tuple(t.strip() for t in self.args.lora_target.split(",") if t.strip()),
+                    original_ds=self.original_route_ds,
+                )
+
+                restored = self._restore_raie_regions(bank, current_model_dir)
+                if not restored:
+                    _ = bank.fit_regions_on_original(self.original_route_ds)
+                if not bank.orig_idx_by_k:
+                    self._rebuild_orig_assignments(bank)
+
+                region_buckets, soft_pairs = bank.map_finetune(ft_ds)
+
+                def _optim_ctor(m):
+                    no_decay = ["bias", "LayerNorm.weight"]
+                    groups = [
+                        {
+                            "params": [
+                                p for n, p in m.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)
+                            ],
+                            "weight_decay": self.args.weight_decay,
+                        },
+                        {
+                            "params": [
+                                p for n, p in m.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)
+                            ],
+                            "weight_decay": 0.0,
+                        },
+                    ]
+                    return torch.optim.AdamW(groups, lr=self.args.finetune_lr)
+
+                def _sched_ctor(optim, steps_per_epoch, epochs):
+                    total = steps_per_epoch * epochs
+                    warm = int(total * self.args.warmup_ratio)
+                    return get_linear_schedule_with_warmup(optim, num_warmup_steps=warm, num_training_steps=total)
+
+                bank.train_regions(
+                    finetune_ds=ft_ds,
+                    finetune_collator=self.ft_collator,
+                    optimizer_ctor=_optim_ctor,
+                    scheduler_ctor=_sched_ctor,
+                    epochs_per_region=self.args.finetune_epochs,
+                    batch_size=self.args.finetune_batch_size,
+                    orig_mix_ratio=1,
+                    region_buckets=region_buckets,
+                    soft_pairs=soft_pairs,
+                )
+
+                stats_pred = bank.route_and_eval(
+                    pred_ds, self.eval_collator, self.item_token_ids, self.module._eval_fn_for_raie, k_list=topk_tuple
+                )
+                stats_orig = bank.route_and_eval(
+                    original_eval_ds, self.eval_collator, self.item_token_ids, self.module._eval_fn_for_raie, k_list=topk_tuple
+                )
+
+                def _to_global(stats):
+                    import pandas as pd
+
+                    df = pd.DataFrame(stats)
+                    w = df["num_samples"]
+                    W = max(1, w.sum())
+                    return {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
+
+                predict_metrics = _to_global(stats_pred)
+                original_metrics = _to_global(stats_orig)
+
+                adapter_names = list(getattr(lora_model, "peft_config", {}).keys())
+                self._save_lora_checkpoint(lora_model, stage_dir, adapter_names, meta={"mode": "raie"})
+                self._save_raie_regions(bank, stage_dir)
+                current_model_dir = stage_dir
+            else:  # pragma: no cover
+                raise ValueError(f"Unsupported mode {self.args.mode}")
 
             results.append(
                 StageResult(
@@ -397,6 +598,235 @@ class MultiStageRunner:
         return mole_model
 
     # -------------------------
+    # Checkpoint helpers
+    # -------------------------
+    def _base_path(self, model_dir: str) -> str:
+        cand = os.path.join(model_dir, "base_model")
+        return cand if os.path.isdir(cand) else model_dir
+
+    def _adapter_path(self, model_dir: str) -> str:
+        cand = os.path.join(model_dir, "adapters")
+        return cand if os.path.isdir(cand) else model_dir
+
+    def _load_meta(self, model_dir: str) -> Dict:
+        meta_path = os.path.join(model_dir, "meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    def _save_meta(self, model_dir: str, meta: Dict):
+        with open(os.path.join(model_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    def _save_lora_checkpoint(self, lora_model: torch.nn.Module, stage_dir: str, adapter_names: List[str], meta: Dict):
+        base_dir = os.path.join(stage_dir, "base_model")
+        adapters_dir = os.path.join(stage_dir, "adapters")
+        os.makedirs(base_dir, exist_ok=True)
+        os.makedirs(adapters_dir, exist_ok=True)
+
+        base_model = lora_model.get_base_model() if hasattr(lora_model, "get_base_model") else lora_model
+        base_model.save_pretrained(base_dir)
+        lora_model.save_pretrained(adapters_dir, selected_adapters=adapter_names)
+
+        meta_to_save = {"mode": self.args.mode, "adapter_names": adapter_names} | meta
+        self._save_meta(stage_dir, meta_to_save)
+
+    # -------------------------
+    # Mode-specific loaders/trainers
+    # -------------------------
+    def _load_lsat_model(self, model_dir: str):
+        base_model = BertForMaskedLM.from_pretrained(self._base_path(model_dir)).to(self.device)
+        adapter_dir = self._adapter_path(model_dir)
+        meta = self._load_meta(model_dir)
+
+        lora_model: torch.nn.Module
+        if os.path.isdir(adapter_dir):
+            try:
+                lora_model = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=True)
+            except Exception:
+                lora_model = self._apply_lora(base_model)
+        else:
+            lora_model = self._apply_lora(base_model)
+
+        adapter_names = meta.get("adapter_names", ["default", "short_term"])
+        for name in adapter_names:
+            if name not in getattr(lora_model, "peft_config", {}):
+                lora_model.add_adapter(name, lora_model.peft_config["default"])
+        return lora_model, adapter_names
+
+    def _train_lsat_stage(self, lora_model: torch.nn.Module, ft_loader: DataLoader):
+        if hasattr(lora_model, "set_adapter") and hasattr(lora_model, "train_adapter"):
+            lora_model.set_adapter("default")
+            lora_model.train_adapter("default")
+        self._train_on_stream(lora_model, epochs=self.args.lsat_long_epochs)
+
+        if hasattr(lora_model, "set_adapter") and hasattr(lora_model, "train_adapter"):
+            lora_model.set_adapter("short_term")
+            lora_model.train_adapter("short_term")
+
+        ft_params = [p for p in lora_model.parameters() if p.requires_grad]
+        ft_optim = torch.optim.AdamW(ft_params, lr=self.args.finetune_lr)
+        ft_steps = len(ft_loader) * max(self.args.lsat_short_epochs, 1)
+        ft_sched = get_linear_schedule_with_warmup(
+            ft_optim, int(ft_steps * self.args.warmup_ratio), ft_steps
+        )
+        for ep in range(1, self.args.lsat_short_epochs + 1):
+            loss = self.module.finetune_one_epoch_lora(
+                lora_model,
+                ft_loader,
+                ft_optim,
+                ft_sched,
+                self.device,
+                self.item_token_ids,
+                self.pad_id,
+                self.cls_id,
+                self.mask_id,
+                plugin="none",
+                grad_clip=self.args.grad_clip,
+                log_every=100,
+            )
+            print(f"[LSAT][short_term][Epoch {ep}] loss={loss:.4f}")
+        return lora_model
+
+    def _load_mole_model(self, model_dir: str):
+        base_model = BertForMaskedLM.from_pretrained(self._base_path(model_dir)).to(self.device)
+        adapter_dir = self._adapter_path(model_dir)
+        meta = self._load_meta(model_dir)
+        adapter_names = meta.get(
+            "adapter_names", ["default"] + [f"expert_{i}" for i in range(self.args.mole_num_experts - 1)]
+        )
+
+        if os.path.isdir(adapter_dir):
+            try:
+                lora_model = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=True)
+            except Exception:
+                lora_model = self._apply_lora(base_model)
+        else:
+            lora_model = self._apply_lora(base_model)
+
+        for name in adapter_names:
+            if name not in getattr(lora_model, "peft_config", {}):
+                lora_model.add_adapter(name, lora_model.peft_config["default"])
+            if hasattr(lora_model, "train_adapter"):
+                try:
+                    lora_model.train_adapter(name)
+                except Exception:
+                    pass
+
+        mole_model = self.module.MoLEMixture(
+            lora_model,
+            adapter_names=tuple(adapter_names),
+            hidden_size=self.args.hidden_size,
+            num_items=len(self.item_token_ids),
+            gate_hidden=self.args.mole_gating_hidden,
+            temperature=meta.get("temperature", self.args.mole_temp),
+            balance_coef=meta.get("balance_coef", self.args.mole_balance),
+        ).to(self.device)
+
+        gate_path = os.path.join(model_dir, "mole_gate.pt")
+        if os.path.isfile(gate_path):
+            state = torch.load(gate_path, map_location=self.device)
+            if "gate_state" in state:
+                mole_model.gate.load_state_dict(state["gate_state"])
+        return mole_model, adapter_names
+
+    def _save_mole_checkpoint(self, mole_model: torch.nn.Module, stage_dir: str, adapter_names: List[str]):
+        self._save_lora_checkpoint(
+            mole_model.model,
+            stage_dir,
+            adapter_names,
+            meta={"temperature": self.args.mole_temp, "balance_coef": self.args.mole_balance},
+        )
+        torch.save(
+            {
+                "gate_state": mole_model.gate.state_dict(),
+                "adapter_names": adapter_names,
+                "temperature": self.args.mole_temp,
+                "balance_coef": self.args.mole_balance,
+            },
+            os.path.join(stage_dir, "mole_gate.pt"),
+        )
+
+    def _load_raie_model(self, model_dir: str):
+        base_model = BertForMaskedLM.from_pretrained(self._base_path(model_dir)).to(self.device)
+        adapter_dir = self._adapter_path(model_dir)
+        meta = self._load_meta(model_dir)
+        if os.path.isdir(adapter_dir):
+            try:
+                lora_model = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=True)
+            except Exception:
+                lora_model = self._apply_lora(base_model)
+        else:
+            lora_model = self._apply_lora(base_model)
+
+        adapter_names = meta.get("adapter_names")
+        if adapter_names is None:
+            adapter_names = list(getattr(lora_model, "peft_config", {}).keys()) or ["default"]
+        for name in adapter_names:
+            if name not in getattr(lora_model, "peft_config", {}):
+                lora_model.add_adapter(name, lora_model.peft_config["default"])
+        return lora_model, adapter_names, meta
+
+    def _save_raie_regions(self, bank, stage_dir: str):
+        state_path = os.path.join(stage_dir, "raie_regions_state.npz")
+        np.savez(
+            state_path,
+            centroids=bank.C,
+            radii=bank.R,
+            sig=bank.sig,
+            kappa=bank.kappa,
+            pi=bank.pi,
+            S=bank.S,
+            n=bank.n,
+            K=bank.K,
+            orig_idx_by_k=np.array(bank.orig_idx_by_k, dtype=object),
+        )
+
+    def _restore_raie_regions(self, bank, model_dir: str):
+        state_path = os.path.join(model_dir, "raie_regions_state.npz")
+        fallback = os.path.join(model_dir, "raie_regions_after_map.npz")
+        if os.path.isfile(state_path):
+            data = np.load(state_path, allow_pickle=True)
+        elif os.path.isfile(fallback):
+            data = np.load(fallback, allow_pickle=True)
+        else:
+            return False
+
+        bank.C = data["centroids"]
+        bank.R = data["radii"]
+        bank.sig = data["sig"]
+        bank.kappa = data["kappa"]
+        bank.pi = data["pi"]
+        bank.S = data["S"]
+        bank.n = data["n"]
+        bank.K = int(data["K"]) if "K" in data else bank.C.shape[0]
+        if "orig_idx_by_k" in data:
+            try:
+                bank.orig_idx_by_k = dict(data["orig_idx_by_k"].item())
+            except Exception:
+                pass
+        return True
+
+    def _rebuild_orig_assignments(self, bank):
+        X = self.module.encode_prompts_to_vecs(
+            bank.model,
+            self.original_route_ds.examples,
+            self.token2id,
+            self.args.max_len,
+            self.pad_id,
+            self.cls_id,
+            self.device,
+            pbar=False,
+        )
+        sims = X @ bank.C.T
+        scores = np.log(np.clip(bank.pi, 1e-8, None))[None, :] + sims * bank.kappa[None, :]
+        route_k = np.argmax(scores, axis=1)
+        bank.orig_idx_by_k = {}
+        for i, k in enumerate(route_k):
+            bank.orig_idx_by_k.setdefault(int(k), []).append(i)
+
+    # -------------------------
     # Summary
     # -------------------------
     def _save_summary(self, results: Iterable[StageResult]):
@@ -477,6 +907,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mole_gating_hidden", type=int, default=128)
     p.add_argument("--mole_temp", type=float, default=0.7)
     p.add_argument("--mole_balance", type=float, default=0.01)
+
+    p.add_argument("--K", type=int, default=10)
+    p.add_argument("--q", type=float, default=0.9)
+    p.add_argument("--T_low", type=float, default=0.7)
+    p.add_argument("--T_high", type=float, default=0.9)
+    p.add_argument("--tau", type=float, default=0.05)
+    p.add_argument("--gamma", type=float, default=0.5)
+    p.add_argument("--gap_thr", type=float, default=0.02)
 
     p.add_argument("--topk", type=str, default="5,10,20")
     p.add_argument("--seed", type=int, default=42)
