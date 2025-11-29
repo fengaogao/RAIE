@@ -582,7 +582,6 @@ class MultiStageRunner:
             lora_model,
             adapter_names=tuple(adapters),
             hidden_size=self.args.hidden_size,
-            num_items=len(self.item_token_ids),
             gate_hidden=self.args.mole_gating_hidden,
             temperature=self.args.mole_temp,
             balance_coef=self.args.mole_balance,
@@ -721,9 +720,8 @@ class MultiStageRunner:
         mole_model = self.module.MoLEMixture(
             lora_model,
             adapter_names=tuple(adapter_names),
-            hidden_size=self.args.hidden_size,
-            num_items=len(self.item_token_ids),
-            gate_hidden=self.args.mole_gating_hidden,
+            item_token_ids=self.item_token_ids,
+            gating_hidden=self.args.mole_gating_hidden,
             temperature=meta.get("temperature", self.args.mole_temp),
             balance_coef=meta.get("balance_coef", self.args.mole_balance),
         ).to(self.device)
