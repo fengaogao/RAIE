@@ -114,6 +114,17 @@ class MultiStageRunner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         return model
 
+    def _load_base_model(self, model_dir: str):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+        )
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
+        model.to(self.device)
+        return model
+
     def _load_lora_from_dir(self, model_dir: str, adapter_names: List[str] = None):
         model = self._fresh_lora_model()
         adapter_dir = model_dir
@@ -131,6 +142,56 @@ class MultiStageRunner:
             except Exception:
                 pass
         return model, names, meta
+
+    def _load_mole_model(self, model_dir: str):
+        lora_model, adapter_names, meta = self._load_lora_from_dir(model_dir)
+        if not adapter_names:
+            adapter_names = ["default"] + [f"expert_{i}" for i in range(self.args.mole_num_experts - 1)]
+
+        base_cfg = getattr(lora_model, "peft_config", {})
+        for name in adapter_names:
+            if name not in base_cfg and "default" in base_cfg:
+                try:
+                    lora_model.add_adapter(name, base_cfg["default"])
+                except Exception:
+                    pass
+
+        mole_model = self.module.MoLEMixtureCausal(
+            lora_model,
+            adapter_names=adapter_names,
+            item_final_token_ids=self.item_final_token_ids,
+            gating_hidden=self.args.mole_gating_hidden,
+            temperature=meta.get("temperature", self.args.mole_temp),
+            balance_coef=meta.get("balance_coef", self.args.mole_balance),
+        ).to(self.device)
+        mole_model.gate.float()
+
+        gate_path = os.path.join(model_dir, "mole_gate.pt")
+        if os.path.isfile(gate_path):
+            state = torch.load(gate_path, map_location=self.device)
+            if "gate_state" in state:
+                mole_model.gate.load_state_dict(state["gate_state"])
+        return mole_model, adapter_names
+
+    def _save_mole_checkpoint(self, mole_model, stage_dir: str, adapter_names: List[str]):
+        self._save_adapter(
+            mole_model.model,
+            stage_dir,
+            adapter_names,
+            meta={
+                "adapter_names": adapter_names,
+                "temperature": self.args.mole_temp,
+                "balance_coef": self.args.mole_balance,
+            },
+        )
+        torch.save(
+            {
+                "gate_state": mole_model.gate.state_dict(),
+                "temperature": self.args.mole_temp,
+                "balance_coef": self.args.mole_balance,
+            },
+            os.path.join(stage_dir, "mole_gate.pt"),
+        )
 
     def _save_adapter(self, model, stage_dir: str, adapter_names: Iterable[str], meta: Dict = None):
         os.makedirs(stage_dir, exist_ok=True)
@@ -181,6 +242,31 @@ class MultiStageRunner:
             )
             print(f"[Finetune][{plugin}] Epoch {ep} loss={loss:.4f}")
         return lora_model
+
+    def _finetune_base(self, base_model, ft_loader: DataLoader):
+        ft_params = [p for p in base_model.parameters() if p.requires_grad]
+        ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
+        total_steps = len(ft_loader) * max(1, self.args.finetune_epochs)
+        ft_sched = get_linear_schedule_with_warmup(
+            ft_optim, int(total_steps * self.args.warmup_ratio), total_steps
+        )
+        for ep in range(1, self.args.finetune_epochs + 1):
+            loss = self.module.finetune_one_epoch_lora(
+                base_model,
+                ft_loader,
+                self.device,
+                self.item_final_token_ids,
+                optimizer=ft_optim,
+                scheduler=ft_sched,
+                fp16=self.args.fp16,
+                plugin="none",
+                replay_buf=None,
+                replay_ratio=0.0,
+                grad_clip=self.args.grad_clip,
+                log_every=100,
+            )
+            print(f"[Finetune][base] Epoch {ep} loss={loss:.4f}")
+        return base_model
 
     def _finetune_lsat(self, model, train_loader: DataLoader, ft_loader: DataLoader):
         long_adapter = "default"
@@ -237,6 +323,26 @@ class MultiStageRunner:
             print(f"[LSAT][Short] Epoch {ep} loss={loss:.4f}")
         return model
 
+    def _finetune_mole(self, mole_model, ft_loader: DataLoader):
+        ft_params = [p for p in mole_model.parameters() if p.requires_grad]
+        ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
+        total_steps = len(ft_loader) * max(1, self.args.finetune_epochs)
+        ft_sched = get_linear_schedule_with_warmup(
+            ft_optim, int(total_steps * self.args.warmup_ratio), total_steps
+        )
+        for ep in range(1, self.args.finetune_epochs + 1):
+            loss = self.module.finetune_one_epoch_mole(
+                mole_model,
+                ft_loader,
+                ft_optim,
+                ft_sched,
+                self.device,
+                grad_clip=self.args.grad_clip,
+                fp16=self.args.fp16,
+            )
+            print(f"[MoLE][Finetune] Epoch {ep} loss={loss:.4f}")
+        return mole_model
+
     def _save_raie_regions(self, bank, stage_dir: str):
         state_path = os.path.join(stage_dir, "raie_regions_state.npz")
         np.savez(
@@ -288,23 +394,41 @@ class MultiStageRunner:
         if not ft_stages:
             raise ValueError("--stages must not be empty")
 
-        # initial model from default adapter
-        base_model = self._fresh_lora_model()
-        default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
-        if not os.path.isdir(default_dir):
-            raise FileNotFoundError(default_dir)
-        base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
-        if hasattr(base_model, "set_adapter"):
-            try:
-                base_model.set_adapter("default")
-            except Exception:
-                pass
+        topk_tuple = tuple(sorted(set(self.args.topk)))
+
+        if self.args.mode == "base":
+            current_model_dir = self.args.resume_base_dir or os.path.join(
+                self.args.output_dir, "base_with_new_tokens"
+            )
+            if not os.path.isdir(current_model_dir):
+                raise FileNotFoundError(current_model_dir)
+            base_model = self._load_base_model(current_model_dir)
+            initial_model = base_model
+        elif self.args.mode == "mole":
+            current_model_dir = self.args.default_adapter_dir or os.path.join(
+                self.args.output_dir, "default"
+            )
+            if not os.path.isdir(current_model_dir):
+                raise FileNotFoundError(current_model_dir)
+            initial_model, _ = self._load_mole_model(current_model_dir)
+        else:
+            base_model = self._fresh_lora_model()
+            default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
+            if not os.path.isdir(default_dir):
+                raise FileNotFoundError(default_dir)
+            base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+            if hasattr(base_model, "set_adapter"):
+                try:
+                    base_model.set_adapter("default")
+                except Exception:
+                    pass
+            initial_model = base_model
+            current_model_dir = default_dir
 
         initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
         initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
-        topk_tuple = tuple(sorted(set(self.args.topk)))
         initial_predict_metrics = self.module.evaluate_causal(
-            base_model,
+            initial_model,
             initial_loader,
             self.device,
             self.item_final_token_ids,
@@ -313,7 +437,7 @@ class MultiStageRunner:
             desc=f"Eval-{ft_stages[0]}",
         )
         initial_original_metrics = self.module.evaluate_causal(
-            base_model,
+            initial_model,
             self.original_loader,
             self.device,
             self.item_final_token_ids,
@@ -327,13 +451,11 @@ class MultiStageRunner:
                 predict_stage=ft_stages[0],
                 predict_metrics=initial_predict_metrics,
                 original_metrics=initial_original_metrics,
-                model_dir=self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens"),
+                model_dir=current_model_dir,
             )
         ]
         print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
         print(f"[Eval][original_stream->original] {initial_original_metrics}")
-
-        current_model_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
 
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
@@ -350,7 +472,31 @@ class MultiStageRunner:
             predict_metrics: Dict[str, float]
             original_metrics: Dict[str, float]
 
-            if self.args.mode in {"lora", "lora_replay", "lora_lwf"}:
+            if self.args.mode == "base":
+                base_model = self._load_base_model(current_model_dir)
+                base_model = self._finetune_base(base_model, ft_loader)
+                predict_metrics = self.module.evaluate_causal(
+                    base_model,
+                    pred_loader,
+                    self.device,
+                    self.item_final_token_ids,
+                    k_list=topk_tuple,
+                    fp16=self.args.fp16,
+                    desc=f"Eval-{pred_name}",
+                )
+                original_metrics = self.module.evaluate_causal(
+                    base_model,
+                    self.original_loader,
+                    self.device,
+                    self.item_final_token_ids,
+                    k_list=topk_tuple,
+                    fp16=self.args.fp16,
+                    desc="Eval-original",
+                )
+                base_model.save_pretrained(stage_dir)
+                current_model_dir = stage_dir
+
+            elif self.args.mode in {"lora", "lora_replay", "lora_lwf"}:
                 replay_buf = None
                 teacher = None
                 if self.args.mode == "lora_replay":
@@ -425,6 +571,30 @@ class MultiStageRunner:
                     k_list=topk_tuple,
                 )
                 self._save_adapter(lora_model, stage_dir, ["default", "short_term"], meta={"adapter_names": ["default", "short_term"]})
+                current_model_dir = stage_dir
+
+            elif self.args.mode == "mole":
+                mole_model, adapter_names = self._load_mole_model(current_model_dir)
+                mole_model = self._finetune_mole(mole_model, ft_loader)
+                predict_metrics = self.module.evaluate_causal(
+                    mole_model,
+                    pred_loader,
+                    self.device,
+                    self.item_final_token_ids,
+                    k_list=topk_tuple,
+                    fp16=self.args.fp16,
+                    desc=f"Eval-{pred_name}",
+                )
+                original_metrics = self.module.evaluate_causal(
+                    mole_model,
+                    self.original_loader,
+                    self.device,
+                    self.item_final_token_ids,
+                    k_list=topk_tuple,
+                    fp16=self.args.fp16,
+                    desc="Eval-original",
+                )
+                self._save_mole_checkpoint(mole_model, stage_dir, adapter_names)
                 current_model_dir = stage_dir
 
             elif self.args.mode == "raie":
@@ -541,7 +711,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-stage runner for OpenP5_RAIE")
     p.add_argument("--data_dir", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
-    p.add_argument("--mode", type=str, default="lora", choices=["lora", "lora_replay", "lora_lwf", "lsat", "raie"])
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="lora",
+        choices=["base", "lora", "lora_replay", "lora_lwf", "lsat", "raie", "mole"],
+    )
     p.add_argument("--stages", type=str, required=True)
     p.add_argument("--pred_stages", type=str, required=True)
 
@@ -571,6 +746,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora_r", type=int, default=8)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--lora_dropout", type=float, default=0.05)
+
+    p.add_argument("--mole_num_experts", type=int, default=3)
+    p.add_argument("--mole_gating_hidden", type=int, default=128)
+    p.add_argument("--mole_temp", type=float, default=0.7)
+    p.add_argument("--mole_balance", type=float, default=0.01)
 
     p.add_argument("--K", type=int, default=3)
     p.add_argument("--q", type=float, default=0.9)
