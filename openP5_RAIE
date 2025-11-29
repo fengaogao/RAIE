@@ -713,7 +713,7 @@ class MoLEMixtureCausal(nn.Module):
             nn.Linear(H, gating_hidden),
             nn.Tanh(),
             nn.Linear(gating_hidden, len(adapter_names))
-        )
+        ).to(dtype=torch.float32)
 
     def forward(self, input_ids, attention_mask, labels=None):
         with torch.set_grad_enabled(self.training):
@@ -778,7 +778,7 @@ def finetune_one_epoch_mole(
     log_every: int = 100,
 ):
     mole_model.train()
-    use_amp = False
+    use_amp = amp_enabled_for_model(mole_model, fp16)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
@@ -2059,6 +2059,18 @@ def stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype):
     _free_cuda(lsat_model)
     if is_distributed: dist.barrier()
 
+
+def _cast_trainable_mole_params_to_fp32(peft_model, adapter_names: List[str]):
+    """Keep base weights in FP16 while moving trainable MoLE adapters to FP32."""
+    base_peft = peft_model.module if hasattr(peft_model, "module") else peft_model
+    for n, p in base_peft.named_parameters():
+        if not p.requires_grad:
+            continue
+        if ("lora_" not in n) and (".lora_" not in n):
+            continue
+        if any((name != "default") and (f".{name}." in n) for name in adapter_names):
+            p.data = p.data.float()
+
 def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
     if not os.path.isdir(base_dir):
@@ -2109,6 +2121,8 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
                 p.requires_grad_(True)
                 break
 
+    _cast_trainable_mole_params_to_fp32(lora_model, adapter_names)
+
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_mole, mid2idx, n_items)
     pad_id = tok_mole.pad_token_id
@@ -2138,6 +2152,7 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
         temperature=args.mole_temp,
         balance_coef=args.mole_balance,
     ).to(device)
+    mole_model.gate.float()
 
     if is_distributed:
         mole_model = torch.nn.parallel.DistributedDataParallel(
