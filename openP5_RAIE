@@ -96,22 +96,18 @@ def set_seed(seed: int = 42, rank: int = 0):
     torch.cuda.manual_seed_all(seed)
 
 def amp_enabled_for_model(model: nn.Module, fp16_flag: bool) -> bool:
-    """Return True when AMP+GradScaler should be used.
-
-    GradScaler expects FP32/BF16 gradients; when models are loaded directly in
-    FP16 to save memory, gradients will also be FP16 and GradScaler raises
-    "Attempting to unscale FP16 gradients.". Enable AMP only when trainable
-    parameters keep higher precision copies.
-    """
     if not (fp16_flag and torch.cuda.is_available()):
         return False
     try:
-        for p in model.parameters():
-            if p.requires_grad and p.dtype in (torch.float32, torch.bfloat16):
-                return True
+        dtypes = {p.dtype for p in model.parameters() if p.requires_grad}
+        if not dtypes:
+            return False
+        if torch.float16 in dtypes:
+            return False
+        return any(dt in (torch.float32, torch.bfloat16) for dt in dtypes)
     except Exception:
         pass
-    return False
+        return False
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
@@ -742,8 +738,9 @@ class MoLEMixtureCausal(nn.Module):
                     print(f"[DBG-X][NON-FINITE LOGITS] adapter={name}")
             logits_list.append(out.logits)
 
-        logits_stack = torch.stack(logits_list, dim=1)  # [B, E, L, V]
+        logits_stack = torch.stack(logits_list, dim=1).to(dtype=gate_weights.dtype)  # [B, E, L, V]
         mix_logits = torch.einsum('be,belv->blv', gate_weights, logits_stack)
+
 
         loss = None
         if labels is not None:
@@ -781,7 +778,7 @@ def finetune_one_epoch_mole(
     log_every: int = 100,
 ):
     mole_model.train()
-    use_amp = amp_enabled_for_model(mole_model, fp16)
+    use_amp = False
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
@@ -1062,6 +1059,8 @@ class RegionBank:
     def _decide_action(self, x: np.ndarray):
         k1, k2, s1, s2, p1, p2 = self._scores_post(x)
         tau1 = self._tau_assign(k1)
+        print(tau1)
+        print(self.delta_min)
         if s1 < -1.0 and p1 < tau1 * 0.7:
             return ("add", k1, k2, p1, p2)
         if p1 >= tau1 and (p1 - p2) >= self.delta_min:
