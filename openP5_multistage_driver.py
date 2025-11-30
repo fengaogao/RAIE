@@ -109,14 +109,62 @@ class MultiStageRunner:
     # Model helpers
     # -------------------------------------------------
     def _fresh_lora_model(self):
-        tok, model = self.module.fresh_lora_model_from_base(
-            self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens"),
-            self.device,
-            self.args.lora_r,
-            self.args.lora_alpha,
-            self.args.lora_dropout,
-            torch.float16 if self.args.fp16 else torch.float32,
-        )
+        """Load (or build) a LoRA-wrapped base model with the expanded vocab.
+
+        Bert4Rec 的多阶段 driver 在内部训练并持久化基础模型；这里保持一致，
+        当 `base_with_new_tokens` 不存在时自动从原始基座构建并保存，避免因为缺少
+        初始检查点而无法进入后续阶段。
+        """
+
+        base_dir = self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens")
+        if os.path.isdir(base_dir):
+            tok, model = self.module.fresh_lora_model_from_base(
+                base_dir,
+                self.device,
+                self.args.lora_r,
+                self.args.lora_alpha,
+                self.args.lora_dropout,
+                torch.float16 if self.args.fp16 else torch.float32,
+            )
+        else:
+            # 从原始基座构建，并补全 item tokens 后保存，保证后续阶段可复用
+            tok = AutoTokenizer.from_pretrained(self.args.model_name_or_path, use_fast=True)
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
+            # 追加物品末端 token
+            tok.add_tokens([t for t in self.final_item_tokens if t not in tok.get_vocab()])
+
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.model_name_or_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+            )
+            if hasattr(model.config, "use_cache"):
+                model.config.use_cache = False
+            model.resize_token_embeddings(len(tok))
+            model.save_pretrained(base_dir)
+            tok.save_pretrained(base_dir)
+
+            # 再包装 LoRA
+            lcfg = self.module.LoraConfig(
+                r=self.args.lora_r,
+                lora_alpha=self.args.lora_alpha,
+                lora_dropout=self.args.lora_dropout,
+                bias="none",
+                task_type=self.module.TaskType.CAUSAL_LM,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+            )
+            model = self.module.get_peft_model(model, lcfg)
+            model.to(self.device)
+
         # keep tokenizer aligned with base
         self.tokenizer = tok
         if self.tokenizer.pad_token is None:
