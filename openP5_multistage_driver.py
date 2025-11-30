@@ -9,7 +9,8 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
 
 
@@ -41,9 +42,18 @@ class MultiStageRunner:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self._init_distributed()
         # 直接从同目录下的源文件加载，避免因为缺少扩展名导致 importlib 无法解析
         self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE.py"))
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            f"cuda:{self.local_rank}" if torch.cuda.is_available() and self.local_rank >= 0 else "cuda:0"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+        self.is_distributed = dist.is_available() and dist.is_initialized()
+        self.is_main = not self.is_distributed or dist.get_rank() == 0
 
         # tokenizer + item vocab
         self.mid2idx, self.n_items = self.module.build_or_load_mid2idx(args, is_main=True)
@@ -57,25 +67,11 @@ class MultiStageRunner:
         # loaders for original evaluation
         self.ds_original = self._make_ds(args.original_jsonl_path or os.path.join(args.data_dir, "original.jsonl"))
         self.ds_train_stream = self._make_ds(args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl"))
-        self.original_loader = DataLoader(
-            self.ds_original,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=2,
-            collate_fn=self.collate,
-            pin_memory=True,
-        )
+        self.original_loader = self._make_loader(self.ds_original, args.batch_size, shuffle=False)
 
         os.makedirs(args.output_dir, exist_ok=True)
 
-        self.stream_loader = DataLoader(
-            self.ds_train_stream,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=2,
-            collate_fn=self.collate,
-            pin_memory=True,
-        )
+        self.stream_loader = self._make_loader(self.ds_train_stream, args.batch_size, shuffle=True, distributed_train=True)
 
     # -------------------------------------------------
     # Dataset helpers
@@ -95,16 +91,48 @@ class MultiStageRunner:
             deterministic_template=True,
         )
 
-    def _make_loader(self, jsonl_path: str, batch_size: int, shuffle: bool) -> DataLoader:
-        ds = self._make_ds(jsonl_path)
+    def _make_loader(
+        self, jsonl_or_ds, batch_size: int, shuffle: bool, distributed_train: bool = False
+    ) -> DataLoader:
+        ds = jsonl_or_ds if not isinstance(jsonl_or_ds, str) else self._make_ds(jsonl_or_ds)
+        sampler = None
+        if distributed_train and self.is_distributed:
+            sampler = DistributedSampler(ds, shuffle=shuffle)
+            shuffle = False
         return DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
+            sampler=sampler,
             num_workers=2,
             collate_fn=self.collate,
             pin_memory=True,
         )
+
+    # -------------------------------------------------
+    # Distributed helpers
+    # -------------------------------------------------
+    def _init_distributed(self):
+        self.local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        if self.local_rank < 0:
+            return
+        if dist.is_available() and not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+
+    def _wrap_ddp(self, model: torch.nn.Module):
+        if not self.is_distributed or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            return model
+        ddp_kwargs = {}
+        if self.device.type == "cuda" and self.device.index is not None:
+            ddp_kwargs["device_ids"] = [self.device.index]
+            ddp_kwargs["output_device"] = self.device.index
+        return torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
+
+    @staticmethod
+    def _set_epoch(loader: DataLoader, epoch: int):
+        if isinstance(loader.sampler, DistributedSampler):
+            loader.sampler.set_epoch(epoch)
 
     # -------------------------------------------------
     # Model helpers
@@ -278,7 +306,7 @@ class MultiStageRunner:
         """
 
         print("[Train] default adapter missing; training on original stream ...")
-        lora_model = self._fresh_lora_model()
+        lora_model = self._wrap_ddp(self._fresh_lora_model())
         trainable = [p for p in lora_model.parameters() if p.requires_grad]
         optim = torch.optim.AdamW(trainable, lr=self.args.lr)
         total_steps = len(self.stream_loader) * max(self.args.epochs, 1)
@@ -287,6 +315,7 @@ class MultiStageRunner:
         )
 
         for ep in range(1, self.args.epochs + 1):
+            self._set_epoch(self.stream_loader, ep)
             loss = self.module.train_one_epoch(
                 lora_model,
                 self.stream_loader,
@@ -298,14 +327,19 @@ class MultiStageRunner:
                 is_main=True,
                 grad_clip=self.args.grad_clip,
             )
-            print(f"[Train][default][Epoch {ep}] loss={loss:.4f}")
+            if self.is_main:
+                print(f"[Train][default][Epoch {ep}] loss={loss:.4f}")
 
         adapter_names = getattr(lora_model, "peft_config", {}).keys() or ["default"]
         default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
-        self._save_adapter(lora_model, default_dir, adapter_names, meta={"adapter_names": list(adapter_names)})
+        if self.is_main:
+            self._save_adapter(lora_model, default_dir, adapter_names, meta={"adapter_names": list(adapter_names)})
+        if self.is_distributed:
+            dist.barrier()
         return lora_model, default_dir
 
     def _finetune_lora(self, lora_model, ft_loader: DataLoader, replay_buf=None, teacher=None):
+        lora_model = self._wrap_ddp(lora_model)
         ft_params = [p for p in lora_model.parameters() if p.requires_grad]
         ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
         total_steps = len(ft_loader) * max(1, self.args.finetune_epochs)
@@ -318,6 +352,7 @@ class MultiStageRunner:
         elif self.args.mode == "lora_lwf":
             plugin = "lwf"
         for ep in range(1, self.args.finetune_epochs + 1):
+            self._set_epoch(ft_loader, ep)
             loss = self.module.finetune_one_epoch_lora(
                 lora_model,
                 ft_loader,
@@ -335,10 +370,12 @@ class MultiStageRunner:
                 lwf_T=self.args.lwf_T,
                 lwf_alpha=self.args.lwf_alpha,
             )
-            print(f"[Finetune][{plugin}] Epoch {ep} loss={loss:.4f}")
+            if self.is_main:
+                print(f"[Finetune][{plugin}] Epoch {ep} loss={loss:.4f}")
         return lora_model
 
     def _finetune_base(self, base_model, ft_loader: DataLoader):
+        base_model = self._wrap_ddp(base_model)
         ft_params = [p for p in base_model.parameters() if p.requires_grad]
         ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
         total_steps = len(ft_loader) * max(1, self.args.finetune_epochs)
@@ -346,6 +383,7 @@ class MultiStageRunner:
             ft_optim, int(total_steps * self.args.warmup_ratio), total_steps
         )
         for ep in range(1, self.args.finetune_epochs + 1):
+            self._set_epoch(ft_loader, ep)
             loss = self.module.finetune_one_epoch_lora(
                 base_model,
                 ft_loader,
@@ -360,10 +398,12 @@ class MultiStageRunner:
                 grad_clip=self.args.grad_clip,
                 log_every=100,
             )
-            print(f"[Finetune][base] Epoch {ep} loss={loss:.4f}")
+            if self.is_main:
+                print(f"[Finetune][base] Epoch {ep} loss={loss:.4f}")
         return base_model
 
     def _finetune_lsat(self, model, train_loader: DataLoader, ft_loader: DataLoader):
+        model = self._wrap_ddp(model)
         long_adapter = "default"
         short_adapter = "short_term"
         if short_adapter not in getattr(model, "peft_config", {}):
@@ -378,6 +418,7 @@ class MultiStageRunner:
             len(train_loader) * max(1, self.args.lsat_long_epochs),
         )
         for ep in range(1, self.args.lsat_long_epochs + 1):
+            self._set_epoch(train_loader, ep)
             loss = self.module.train_one_epoch(
                 model,
                 train_loader,
@@ -389,7 +430,8 @@ class MultiStageRunner:
                 is_main=True,
                 grad_clip=self.args.grad_clip,
             )
-            print(f"[LSAT][Long] Epoch {ep} loss={loss:.4f}")
+            if self.is_main:
+                print(f"[LSAT][Long] Epoch {ep} loss={loss:.4f}")
 
         if hasattr(model, "set_adapter") and hasattr(model, "train_adapter"):
             model.set_adapter(short_adapter)
@@ -401,6 +443,7 @@ class MultiStageRunner:
             len(ft_loader) * max(1, self.args.lsat_short_epochs),
         )
         for ep in range(1, self.args.lsat_short_epochs + 1):
+            self._set_epoch(ft_loader, ep)
             loss = self.module.finetune_one_epoch_lora(
                 model,
                 ft_loader,
@@ -415,10 +458,12 @@ class MultiStageRunner:
                 grad_clip=1.0,
                 log_every=100,
             )
-            print(f"[LSAT][Short] Epoch {ep} loss={loss:.4f}")
+            if self.is_main:
+                print(f"[LSAT][Short] Epoch {ep} loss={loss:.4f}")
         return model
 
     def _finetune_mole(self, mole_model, ft_loader: DataLoader):
+        mole_model = self._wrap_ddp(mole_model)
         ft_params = [p for p in mole_model.parameters() if p.requires_grad]
         ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
         total_steps = len(ft_loader) * max(1, self.args.finetune_epochs)
@@ -426,6 +471,7 @@ class MultiStageRunner:
             ft_optim, int(total_steps * self.args.warmup_ratio), total_steps
         )
         for ep in range(1, self.args.finetune_epochs + 1):
+            self._set_epoch(ft_loader, ep)
             loss = self.module.finetune_one_epoch_mole(
                 mole_model,
                 ft_loader,
@@ -435,7 +481,8 @@ class MultiStageRunner:
                 grad_clip=self.args.grad_clip,
                 fp16=self.args.fp16,
             )
-            print(f"[MoLE][Finetune] Epoch {ep} loss={loss:.4f}")
+            if self.is_main:
+                print(f"[MoLE][Finetune] Epoch {ep} loss={loss:.4f}")
         return mole_model
 
     def _save_raie_regions(self, bank, stage_dir: str):
@@ -521,49 +568,54 @@ class MultiStageRunner:
             initial_model = base_model
             current_model_dir = default_dir
 
-        initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
-        initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
-        initial_predict_metrics = self.module.evaluate_causal(
-            initial_model,
-            initial_loader,
-            self.device,
-            self.item_final_token_ids,
-            k_list=topk_tuple,
-            fp16=self.args.fp16,
-            desc=f"Eval-{ft_stages[0]}",
-        )
-        initial_original_metrics = self.module.evaluate_causal(
-            initial_model,
-            self.original_loader,
-            self.device,
-            self.item_final_token_ids,
-            k_list=topk_tuple,
-            fp16=self.args.fp16,
-            desc="Eval-original",
-        )
-        results: List[StageResult] = [
-            StageResult(
-                finetune_stage="original_stream",
-                predict_stage=ft_stages[0],
-                predict_metrics=initial_predict_metrics,
-                original_metrics=initial_original_metrics,
-                model_dir=current_model_dir,
+        results: List[StageResult] = []
+        if self.is_main:
+            initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
+            initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
+            initial_predict_metrics = self.module.evaluate_causal(
+                initial_model if not hasattr(initial_model, "module") else initial_model.module,
+                initial_loader,
+                self.device,
+                self.item_final_token_ids,
+                k_list=topk_tuple,
+                fp16=self.args.fp16,
+                desc=f"Eval-{ft_stages[0]}",
             )
-        ]
-        print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
-        print(f"[Eval][original_stream->original] {initial_original_metrics}")
+            initial_original_metrics = self.module.evaluate_causal(
+                initial_model if not hasattr(initial_model, "module") else initial_model.module,
+                self.original_loader,
+                self.device,
+                self.item_final_token_ids,
+                k_list=topk_tuple,
+                fp16=self.args.fp16,
+                desc="Eval-original",
+            )
+            results.append(
+                StageResult(
+                    finetune_stage="original_stream",
+                    predict_stage=ft_stages[0],
+                    predict_metrics=initial_predict_metrics,
+                    original_metrics=initial_original_metrics,
+                    model_dir=current_model_dir,
+                )
+            )
+            print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
+            print(f"[Eval][original_stream->original] {initial_original_metrics}")
 
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
             pred_path = os.path.join(self.args.data_dir, f"{pred_name}.jsonl")
-            ft_loader = self._make_loader(ft_path, self.args.finetune_batch_size, shuffle=True)
+            ft_loader = self._make_loader(ft_path, self.args.finetune_batch_size, shuffle=True, distributed_train=True)
             pred_loader = self._make_loader(pred_path, self.args.batch_size, shuffle=False)
 
             stage_dir = os.path.join(self.args.output_dir, f"stage_{ft_name}")
-            if os.path.isdir(stage_dir):
-                shutil.rmtree(stage_dir)
-            os.makedirs(stage_dir, exist_ok=True)
+            if self.is_main:
+                if os.path.isdir(stage_dir):
+                    shutil.rmtree(stage_dir)
+                os.makedirs(stage_dir, exist_ok=True)
+            if self.is_distributed:
+                dist.barrier()
 
             predict_metrics: Dict[str, float]
             original_metrics: Dict[str, float]
@@ -571,26 +623,32 @@ class MultiStageRunner:
             if self.args.mode == "base":
                 base_model = self._load_base_model(current_model_dir)
                 base_model = self._finetune_base(base_model, ft_loader)
-                predict_metrics = self.module.evaluate_causal(
-                    base_model,
-                    pred_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc=f"Eval-{pred_name}",
-                )
-                original_metrics = self.module.evaluate_causal(
-                    base_model,
-                    self.original_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc="Eval-original",
-                )
-                base_model.save_pretrained(stage_dir)
+                base_eval_model = base_model if not hasattr(base_model, "module") else base_model.module
+                if self.is_main:
+                    predict_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        pred_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc=f"Eval-{pred_name}",
+                    )
+                    original_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        self.original_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc="Eval-original",
+                    )
+                    base_eval_model.save_pretrained(stage_dir)
+                else:
+                    predict_metrics, original_metrics = {}, {}
                 current_model_dir = stage_dir
+                if self.is_distributed:
+                    dist.barrier()
 
             elif self.args.mode in {"lora", "lora_replay", "lora_lwf"}:
                 replay_buf = None
@@ -614,84 +672,105 @@ class MultiStageRunner:
 
                 lora_model, adapter_names, _ = self._load_lora_from_dir(current_model_dir)
                 lora_model = self._finetune_lora(lora_model, ft_loader, replay_buf=replay_buf, teacher=teacher)
-                predict_metrics = self.module.evaluate_causal(
-                    lora_model,
-                    pred_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc=f"Eval-{pred_name}",
-                )
-                original_metrics = self.module.evaluate_causal(
-                    lora_model,
-                    self.original_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc="Eval-original",
-                )
-                self._save_adapter(lora_model, stage_dir, adapter_names, meta={"adapter_names": adapter_names})
+                base_eval_model = lora_model if not hasattr(lora_model, "module") else lora_model.module
+                if self.is_main:
+                    predict_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        pred_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc=f"Eval-{pred_name}",
+                    )
+                    original_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        self.original_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc="Eval-original",
+                    )
+                    self._save_adapter(base_eval_model, stage_dir, adapter_names, meta={"adapter_names": adapter_names})
+                else:
+                    predict_metrics, original_metrics = {}, {}
                 current_model_dir = stage_dir
+                if self.is_distributed:
+                    dist.barrier()
 
             elif self.args.mode == "lsat":
                 lora_model, adapter_names, _ = self._load_lora_from_dir(current_model_dir)
-                train_loader = DataLoader(
+                train_loader = self._make_loader(
                     self.ds_train_stream,
-                    batch_size=self.args.batch_size,
+                    self.args.batch_size,
                     shuffle=True,
-                    num_workers=2,
-                    collate_fn=self.collate,
-                    pin_memory=True,
+                    distributed_train=True,
                 )
                 lora_model = self._finetune_lsat(lora_model, train_loader, ft_loader)
-                predict_metrics = self.module.evaluate_lsat_causal(
-                    lora_model,
-                    pred_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    long_adapter="default",
-                    short_adapter="short_term",
-                    alpha=self.args.lsat_alpha,
-                    k_list=topk_tuple,
-                )
-                original_metrics = self.module.evaluate_lsat_causal(
-                    lora_model,
-                    self.original_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    long_adapter="default",
-                    short_adapter="short_term",
-                    alpha=self.args.lsat_alpha,
-                    k_list=topk_tuple,
-                )
-                self._save_adapter(lora_model, stage_dir, ["default", "short_term"], meta={"adapter_names": ["default", "short_term"]})
+                base_eval_model = lora_model if not hasattr(lora_model, "module") else lora_model.module
+                if self.is_main:
+                    predict_metrics = self.module.evaluate_lsat_causal(
+                        base_eval_model,
+                        pred_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        long_adapter="default",
+                        short_adapter="short_term",
+                        alpha=self.args.lsat_alpha,
+                        k_list=topk_tuple,
+                    )
+                    original_metrics = self.module.evaluate_lsat_causal(
+                        base_eval_model,
+                        self.original_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        long_adapter="default",
+                        short_adapter="short_term",
+                        alpha=self.args.lsat_alpha,
+                        k_list=topk_tuple,
+                    )
+                    self._save_adapter(
+                        base_eval_model,
+                        stage_dir,
+                        ["default", "short_term"],
+                        meta={"adapter_names": ["default", "short_term"]},
+                    )
+                else:
+                    predict_metrics, original_metrics = {}, {}
                 current_model_dir = stage_dir
+                if self.is_distributed:
+                    dist.barrier()
 
             elif self.args.mode == "mole":
                 mole_model, adapter_names = self._load_mole_model(current_model_dir)
                 mole_model = self._finetune_mole(mole_model, ft_loader)
-                predict_metrics = self.module.evaluate_causal(
-                    mole_model,
-                    pred_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc=f"Eval-{pred_name}",
-                )
-                original_metrics = self.module.evaluate_causal(
-                    mole_model,
-                    self.original_loader,
-                    self.device,
-                    self.item_final_token_ids,
-                    k_list=topk_tuple,
-                    fp16=self.args.fp16,
-                    desc="Eval-original",
-                )
-                self._save_mole_checkpoint(mole_model, stage_dir, adapter_names)
+                base_eval_model = mole_model if not hasattr(mole_model, "module") else mole_model.module
+                if self.is_main:
+                    predict_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        pred_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc=f"Eval-{pred_name}",
+                    )
+                    original_metrics = self.module.evaluate_causal(
+                        base_eval_model,
+                        self.original_loader,
+                        self.device,
+                        self.item_final_token_ids,
+                        k_list=topk_tuple,
+                        fp16=self.args.fp16,
+                        desc="Eval-original",
+                    )
+                    self._save_mole_checkpoint(base_eval_model, stage_dir, adapter_names)
+                else:
+                    predict_metrics, original_metrics = {}, {}
                 current_model_dir = stage_dir
+                if self.is_distributed:
+                    dist.barrier()
 
             elif self.args.mode == "raie":
                 lora_model, adapter_names, meta = self._load_lora_from_dir(current_model_dir)
@@ -740,43 +819,54 @@ class MultiStageRunner:
                     soft_pairs=soft_pairs,
                 )
 
-                stats_pred = bank.route_and_eval(
-                    self._make_ds(pred_path), self.collate, k_list=topk_tuple, root=stage_dir, fp16=self.args.fp16
-                )
-                stats_orig = bank.route_and_eval(
-                    self.ds_original, self.collate, k_list=topk_tuple, root=stage_dir, fp16=self.args.fp16
-                )
+                if self.is_main:
+                    stats_pred = bank.route_and_eval(
+                        self._make_ds(pred_path), self.collate, k_list=topk_tuple, root=stage_dir, fp16=self.args.fp16
+                    )
+                    stats_orig = bank.route_and_eval(
+                        self.ds_original, self.collate, k_list=topk_tuple, root=stage_dir, fp16=self.args.fp16
+                    )
 
-                def _to_global(stats):
-                    import pandas as pd
+                    def _to_global(stats):
+                        import pandas as pd
 
-                    df = pd.DataFrame(stats)
-                    w = df["num_samples"]
-                    W = max(1, w.sum())
-                    return {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
+                        df = pd.DataFrame(stats)
+                        w = df["num_samples"]
+                        W = max(1, w.sum())
+                        return {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
 
-                predict_metrics = _to_global(stats_pred)
-                original_metrics = _to_global(stats_orig)
-                self._save_raie_regions(bank, stage_dir)
-                self._save_adapter(lora_model, stage_dir, adapter_names, meta=meta or {"adapter_names": adapter_names})
+                    predict_metrics = _to_global(stats_pred)
+                    original_metrics = _to_global(stats_orig)
+                    self._save_raie_regions(bank, stage_dir)
+                    self._save_adapter(
+                        lora_model, stage_dir, adapter_names, meta=meta or {"adapter_names": adapter_names}
+                    )
+                else:
+                    predict_metrics, original_metrics = {}, {}
                 current_model_dir = stage_dir
+                if self.is_distributed:
+                    dist.barrier()
 
             else:  # pragma: no cover - defensive
                 raise ValueError(f"Unsupported mode {self.args.mode}")
 
-            results.append(
-                StageResult(
-                    finetune_stage=ft_name,
-                    predict_stage=pred_name,
-                    predict_metrics=predict_metrics,
-                    original_metrics=original_metrics,
-                    model_dir=stage_dir,
+            if self.is_main:
+                results.append(
+                    StageResult(
+                        finetune_stage=ft_name,
+                        predict_stage=pred_name,
+                        predict_metrics=predict_metrics,
+                        original_metrics=original_metrics,
+                        model_dir=stage_dir,
+                    )
                 )
-            )
-            print(f"[Eval][{ft_name}->{pred_name}] {predict_metrics}")
-            print(f"[Eval][{ft_name}->original] {original_metrics}")
+                print(f"[Eval][{ft_name}->{pred_name}] {predict_metrics}")
+                print(f"[Eval][{ft_name}->original] {original_metrics}")
 
-        self._save_summary(results)
+        if self.is_main:
+            self._save_summary(results)
+        if self.is_distributed:
+            dist.barrier()
         return results
 
     # -------------------------------------------------
