@@ -804,8 +804,8 @@ class MultiStageRunner:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-stage runner for OpenP5_RAIE")
-    p.add_argument("--data_dir", type=str, required=True)
-    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--data_dir", type=str, default="/home/zj/code/yelp/")
+    p.add_argument("--output_dir", type=str, default="./runs/openP5_yelp")
     p.add_argument(
         "--mode",
         type=str,
@@ -815,28 +815,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stages", type=str, required=True)
     p.add_argument("--pred_stages", type=str, required=True)
 
-    p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen1.5-0.5B")
-    p.add_argument("--resume_base_dir", type=str, default=None)
-    p.add_argument("--default_adapter_dir", type=str, default=None)
+    p.add_argument("--model_name_or_path", type=str, default="/home/zj/model/Llama-2-7b-hf")
+    p.add_argument("--resume_base_dir", type=str, default="")
+    p.add_argument("--default_adapter_dir", type=str, default="")
 
-    p.add_argument("--max_history", type=int, default=50)
-    p.add_argument("--final_token_only_loss", action="store_true")
+    p.add_argument("--max_history", type=int, default=20)
+    p.add_argument("--final_token_only_loss", action="store_true", default=True)
 
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--finetune_batch_size", type=int, default=8)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--finetune_epochs", type=int, default=1)
-    p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--warmup_ratio", type=float, default=0.1)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--finetune_batch_size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--finetune_epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--replay_ratio", type=float, default=0.3)
     p.add_argument("--lwf_T", type=float, default=2.0)
     p.add_argument("--lwf_alpha", type=float, default=0.5)
     p.add_argument("--lsat_alpha", type=float, default=0.6)
     p.add_argument("--lsat_long_epochs", type=int, default=1)
-    p.add_argument("--lsat_short_epochs", type=int, default=1)
+    p.add_argument("--lsat_short_epochs", type=int, default=3)
     p.add_argument("--topk", type=int, nargs="+", default=[5, 10, 20])
-    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--fp16", type=bool, default=True)
 
     p.add_argument("--lora_r", type=int, default=8)
     p.add_argument("--lora_alpha", type=int, default=16)
@@ -855,8 +855,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gamma", type=float, default=0.5)
     p.add_argument("--gap_thr", type=float, default=0.02)
 
-    p.add_argument("--train_jsonl_path", type=str, default=None)
-    p.add_argument("--original_jsonl_path", type=str, default=None)
+    p.add_argument("--train_jsonl_path", type=str, default="")
+    p.add_argument("--original_jsonl_path", type=str, default="")
+    p.add_argument("--test_jsonl_path", type=str, default="")
+    p.add_argument("--item_ids_path", type=str, default="")
+    p.add_argument("--finetune_jsonl_path", type=str, default="")
     return p.parse_args()
 
 
