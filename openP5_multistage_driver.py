@@ -41,7 +41,8 @@ class MultiStageRunner:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE"))
+        # 直接从同目录下的源文件加载，避免因为缺少扩展名导致 importlib 无法解析
+        self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE.py"))
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         # tokenizer + item vocab
