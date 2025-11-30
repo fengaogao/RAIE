@@ -67,6 +67,15 @@ class MultiStageRunner:
 
         os.makedirs(args.output_dir, exist_ok=True)
 
+        self.stream_loader = DataLoader(
+            self.ds_train_stream,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=self.collate,
+            pin_memory=True,
+        )
+
     # -------------------------------------------------
     # Dataset helpers
     # -------------------------------------------------
@@ -210,6 +219,43 @@ class MultiStageRunner:
     # -------------------------------------------------
     # Training helpers
     # -------------------------------------------------
+    def _train_default_adapter(self) -> Tuple[torch.nn.Module, str]:
+        """Train a default adapter on the original stream when none exists.
+
+        This mirrors the Bert4Rec multi-stage driver behaviour where the
+        baseline model is established inside the runner, ensuring the
+        subsequent multi-stage finetune/predict cycles have a valid starting
+        checkpoint.
+        """
+
+        print("[Train] default adapter missing; training on original stream ...")
+        lora_model = self._fresh_lora_model()
+        trainable = [p for p in lora_model.parameters() if p.requires_grad]
+        optim = torch.optim.AdamW(trainable, lr=self.args.lr)
+        total_steps = len(self.stream_loader) * max(self.args.epochs, 1)
+        sched = get_linear_schedule_with_warmup(
+            optim, int(total_steps * self.args.warmup_ratio), total_steps
+        )
+
+        for ep in range(1, self.args.epochs + 1):
+            loss = self.module.train_one_epoch(
+                lora_model,
+                self.stream_loader,
+                optim,
+                sched,
+                self.device,
+                item_final_token_ids=self.item_final_token_ids,
+                fp16=self.args.fp16,
+                is_main=True,
+                grad_clip=self.args.grad_clip,
+            )
+            print(f"[Train][default][Epoch {ep}] loss={loss:.4f}")
+
+        adapter_names = getattr(lora_model, "peft_config", {}).keys() or ["default"]
+        default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
+        self._save_adapter(lora_model, default_dir, adapter_names, meta={"adapter_names": list(adapter_names)})
+        return lora_model, default_dir
+
     def _finetune_lora(self, lora_model, ft_loader: DataLoader, replay_buf=None, teacher=None):
         ft_params = [p for p in lora_model.parameters() if p.requires_grad]
         ft_optim = torch.optim.AdamW(ft_params, lr=self.args.lr)
@@ -409,13 +455,14 @@ class MultiStageRunner:
                 self.args.output_dir, "default"
             )
             if not os.path.isdir(current_model_dir):
-                raise FileNotFoundError(current_model_dir)
-            initial_model, _ = self._load_mole_model(current_model_dir)
+                initial_model, current_model_dir = self._train_default_adapter()
+            else:
+                initial_model, _ = self._load_mole_model(current_model_dir)
         else:
             base_model = self._fresh_lora_model()
             default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
             if not os.path.isdir(default_dir):
-                raise FileNotFoundError(default_dir)
+                base_model, default_dir = self._train_default_adapter()
             base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
             if hasattr(base_model, "set_adapter"):
                 try:
