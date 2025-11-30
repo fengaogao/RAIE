@@ -4,6 +4,7 @@ import json
 import os
 import types
 from dataclasses import dataclass
+import random
 from typing import Dict, Iterable, List, Tuple
 import shutil
 import torch
@@ -328,6 +329,18 @@ class MultiStageRunner:
                 self._save_lora_checkpoint(
                     eval_model, stage_dir, ["default", "short_term"], meta={"mode": "lsat"}
                 )
+                current_model_dir = stage_dir
+            elif self.args.mode == "ebpr":
+                base_model = BertForMaskedLM.from_pretrained(self._base_path(current_model_dir)).to(self.device)
+                edit_pairs = self._mine_edit_pairs_ebpr(base_model, ft_ds)
+                eval_model = self._finetune_ebpr(base_model, edit_pairs)
+                predict_metrics = self.module.evaluate(
+                    eval_model, pred_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                original_metrics = self.module.evaluate(
+                    eval_model, original_loader, self.device, self.item_token_ids, topk=topk_tuple
+                )
+                eval_model.save_pretrained(stage_dir)
                 current_model_dir = stage_dir
             elif self.args.mode == "mole":
                 mole_model, adapter_names = self._load_mole_model(current_model_dir)
@@ -692,6 +705,123 @@ class MultiStageRunner:
             print(f"[LSAT][short_term][Epoch {ep}] loss={loss:.4f}")
         return lora_model
 
+    def _mine_edit_pairs_ebpr(self, model: torch.nn.Module, ds) -> List[Dict[str, List[int]]]:
+        model.eval()
+        pairs: List[Dict[str, List[int]]] = []
+        item_mask = torch.full((len(self.id2token),), float("-inf"), device=self.device)
+        item_mask[self.item_token_ids] = 0.0
+
+        with torch.no_grad():
+            batch_size = self.args.ebpr_batch_size
+            for start in range(0, len(ds.examples), batch_size):
+                if len(pairs) >= self.args.ebpr_max_pairs:
+                    break
+                chunk = ds.examples[start : start + batch_size]
+                encoded = self.eval_collator(chunk)
+                input_ids = encoded["input_ids"].to(self.device)
+                attention_mask = encoded["attention_mask"].to(self.device)
+                labels = encoded["labels"].to(self.device)
+
+                out = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = out.logits
+                final_pos = attention_mask.sum(dim=1) - 1
+                rows = torch.arange(input_ids.size(0), device=self.device)
+                logits_final = logits[rows, final_pos, :] + item_mask
+
+                max_k = self.args.ebpr_topk
+                top_logits, top_idx = torch.topk(logits_final, k=max_k, dim=1)
+
+                for i, ex in enumerate(chunk):
+                    prompt_ids = [self.token2id.get(t, self.token2id["[UNK]"]) for t in ex.prompt_tokens[-self.args.max_len :]]
+                    tgt_id = int(labels[i].item())
+                    picked = 0
+                    for pred_id in top_idx[i].tolist():
+                        if pred_id == tgt_id:
+                            continue
+                        pairs.append({"prompt_ids": prompt_ids, "bad_id": pred_id})
+                        picked += 1
+                        if picked >= self.args.ebpr_per_user or len(pairs) >= self.args.ebpr_max_pairs:
+                            break
+        return pairs
+
+    def _finetune_ebpr(self, model: torch.nn.Module, edit_pairs: List[Dict[str, List[int]]]):
+        if not edit_pairs:
+            print("[EBPR] No edit pairs mined; skipping finetune.")
+            return model
+
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        params = []
+        emb_in = model.get_input_embeddings()
+        if emb_in is not None:
+            emb_in.weight.requires_grad_(True)
+            params.append(emb_in.weight)
+        emb_out = model.get_output_embeddings()
+        if emb_out is not None and emb_out is not emb_in:
+            emb_out.weight.requires_grad_(True)
+            params.append(emb_out.weight)
+
+        if not params:
+            print("[EBPR] No trainable parameters found; aborting.")
+            return model
+
+        optim = torch.optim.Adam(params, lr=self.args.ebpr_lr)
+        item_vocab = torch.tensor(self.item_token_ids, device=self.device, dtype=torch.long)
+
+        def _build_batch(rows: List[Dict[str, List[int]]]):
+            B = len(rows)
+            seq_len = self.args.max_len + 2
+            input_ids = torch.full((B, seq_len), self.pad_id, device=self.device, dtype=torch.long)
+            attention_mask = torch.zeros((B, seq_len), device=self.device, dtype=torch.long)
+            bad_ids = torch.zeros((B,), device=self.device, dtype=torch.long)
+            for i, r in enumerate(rows):
+                pos = 0
+                input_ids[i, pos] = self.cls_id
+                pos += 1
+                prompt = r["prompt_ids"][-self.args.max_len :]
+                if prompt:
+                    plen = len(prompt)
+                    input_ids[i, pos : pos + plen] = torch.tensor(prompt, device=self.device)
+                    pos += plen
+                input_ids[i, pos] = self.mask_id
+                attention_mask[i, : pos + 1] = 1
+                bad_ids[i] = int(r["bad_id"])
+            return input_ids, attention_mask, bad_ids
+
+        steps = max(1, self.args.ebpr_steps)
+        neg_per_step = max(1, self.args.ebpr_neg_per_step)
+        batch_size = min(self.args.ebpr_batch_size, len(edit_pairs))
+        for step in range(steps):
+            sample = random.sample(edit_pairs, k=batch_size) if len(edit_pairs) > batch_size else edit_pairs
+            input_ids, attention_mask, bad_ids = _build_batch(sample)
+
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = out.logits
+            final_pos = attention_mask.sum(dim=1) - 1
+            rows = torch.arange(input_ids.size(0), device=self.device)
+            logits_final = logits[rows, final_pos, :]
+
+            neg_idx = torch.randint(0, item_vocab.numel(), (batch_size, neg_per_step), device=self.device)
+            neg_ids = item_vocab[neg_idx]
+            neg_ids = torch.where(neg_ids == bad_ids.view(-1, 1), item_vocab[(neg_idx + 1) % item_vocab.numel()], neg_ids)
+
+            s_bad = logits_final.gather(1, bad_ids.view(-1, 1)).expand(-1, neg_per_step)
+            s_neg = logits_final.gather(1, neg_ids)
+            loss = -torch.log(torch.sigmoid(s_neg - s_bad) + 1e-8).mean()
+
+            optim.zero_grad(set_to_none=True)
+            loss.backward()
+            if self.args.grad_clip and self.args.grad_clip > 0:
+                for p in params:
+                    torch.nn.utils.clip_grad_norm_(p, self.args.grad_clip)
+            optim.step()
+            print(f"[EBPR][Step {step+1}/{steps}] loss={float(loss.item()):.4f}")
+
+        for p in params:
+            p.requires_grad_(False)
+        return model
+
     def _load_mole_model(self, model_dir: str):
         base_model = BertForMaskedLM.from_pretrained(self._base_path(model_dir)).to(self.device)
         adapter_dir = self._adapter_path(model_dir)
@@ -861,6 +991,7 @@ def parse_args() -> argparse.Namespace:
         "lora_replay",
         "lora_lwf",
         "lsat",
+        "ebpr",
         "raie",
         "mole",
     ])
@@ -917,6 +1048,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tau", type=float, default=0.05)
     p.add_argument("--gamma", type=float, default=0.5)
     p.add_argument("--gap_thr", type=float, default=0.02)
+
+    p.add_argument("--ebpr_steps", type=int, default=20)
+    p.add_argument("--ebpr_lr", type=float, default=3e-4)
+    p.add_argument("--ebpr_neg_per_step", type=int, default=20)
+    p.add_argument("--ebpr_batch_size", type=int, default=256)
+    p.add_argument("--ebpr_topk", type=int, default=10)
+    p.add_argument("--ebpr_per_user", type=int, default=2)
+    p.add_argument("--ebpr_max_pairs", type=int, default=10000)
 
     p.add_argument("--topk", type=str, default="5,10,20")
     p.add_argument("--seed", type=int, default=42)
