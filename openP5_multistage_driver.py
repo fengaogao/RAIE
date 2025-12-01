@@ -370,6 +370,65 @@ class MultiStageRunner:
             dist.barrier()
         return lora_model, default_dir
 
+    def _train_base_model(self) -> Tuple[torch.nn.Module, str]:
+        """Train a base model with expanded vocab on the original stream.
+
+        Mirrors the Bert4Rec driver behaviour of constructing the starting
+        checkpoint inside the runner when it doesn't exist.
+        """
+
+        print("[Train] base model missing; training on original stream ...")
+        tok = AutoTokenizer.from_pretrained(self.args.model_name_or_path, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.add_tokens([t for t in self.final_item_tokens if t not in tok.get_vocab()])
+
+        model = AutoModelForCausalLM.from_pretrained(
+            self.args.model_name_or_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+        )
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
+        model.resize_token_embeddings(len(tok))
+        model.to(self.device)
+
+        model = self._wrap_ddp(model)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optim = torch.optim.AdamW(trainable, lr=self.args.lr)
+        total_steps = len(self.stream_loader) * max(self.args.epochs, 1)
+        sched = get_linear_schedule_with_warmup(
+            optim, int(total_steps * self.args.warmup_ratio), total_steps
+        )
+
+        for ep in range(1, self.args.epochs + 1):
+            self._set_epoch(self.stream_loader, ep)
+            loss = self.module.train_one_epoch(
+                model,
+                self.stream_loader,
+                optim,
+                sched,
+                self.device,
+                item_final_token_ids=self.item_final_token_ids,
+                fp16=self.args.fp16,
+                is_main=True,
+                grad_clip=self.args.grad_clip,
+            )
+            if self.is_main:
+                print(f"[Train][base][Epoch {ep}] loss={loss:.4f}")
+
+        base_dir = self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens")
+        if self.is_main:
+            base_eval_model = model.module if hasattr(model, "module") else model
+            base_eval_model.save_pretrained(base_dir)
+            tok.save_pretrained(base_dir)
+        if self.is_distributed:
+            dist.barrier()
+        self.tokenizer = tok
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        return model, base_dir
+
     def _finetune_lora(self, lora_model, ft_loader: DataLoader, replay_buf=None, teacher=None):
         lora_model = self._wrap_ddp(lora_model)
         ft_params = [p for p in lora_model.parameters() if p.requires_grad]
@@ -575,9 +634,9 @@ class MultiStageRunner:
                 self.args.output_dir, "base_with_new_tokens"
             )
             if not os.path.isdir(current_model_dir):
-                raise FileNotFoundError(current_model_dir)
-            base_model = self._load_base_model(current_model_dir)
-            initial_model = base_model
+                initial_model, current_model_dir = self._train_base_model()
+            else:
+                initial_model = self._load_base_model(current_model_dir)
         elif self.args.mode == "mole":
             current_model_dir = self.args.default_adapter_dir or os.path.join(
                 self.args.output_dir, "default"
@@ -587,22 +646,19 @@ class MultiStageRunner:
             else:
                 initial_model, _ = self._load_mole_model(current_model_dir)
         else:
-            base_model = self._fresh_lora_model()
-            default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
-            if not os.path.isdir(default_dir):
-                base_model, default_dir = self._train_default_adapter()
-            base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
-            if hasattr(base_model, "set_adapter"):
-                try:
-                    base_model.set_adapter("default")
-                except Exception:
-                    pass
-            initial_model = base_model
-            current_model_dir = default_dir
+            current_model_dir = self.args.default_adapter_dir or os.path.join(
+                self.args.output_dir, "default"
+            )
+            if not os.path.isdir(current_model_dir):
+                initial_model, current_model_dir = self._train_default_adapter()
+            else:
+                initial_model, _, _ = self._load_lora_from_dir(current_model_dir)
 
         results: List[StageResult] = []
         if self.is_main:
             initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
+            if not os.path.exists(initial_pred_path):
+                raise FileNotFoundError(initial_pred_path)
             initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
             initial_predict_metrics = self.module.evaluate_causal(
                 initial_model if not hasattr(initial_model, "module") else initial_model.module,
@@ -640,6 +696,10 @@ class MultiStageRunner:
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
             pred_path = os.path.join(self.args.data_dir, f"{pred_name}.jsonl")
+            if not os.path.exists(ft_path):
+                raise FileNotFoundError(ft_path)
+            if not os.path.exists(pred_path):
+                raise FileNotFoundError(pred_path)
             ft_loader = self._make_loader(ft_path, self.args.finetune_batch_size, shuffle=True, distributed_train=True)
             pred_loader = self._make_loader(pred_path, self.args.batch_size, shuffle=False)
 
