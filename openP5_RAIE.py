@@ -1059,8 +1059,6 @@ class RegionBank:
     def _decide_action(self, x: np.ndarray):
         k1, k2, s1, s2, p1, p2 = self._scores_post(x)
         tau1 = self._tau_assign(k1)
-        print(tau1)
-        print(self.delta_min)
         if s1 < -1.0 and p1 < tau1 * 0.7:
             return ("add", k1, k2, p1, p2)
         if p1 >= tau1 and (p1 - p2) >= self.delta_min:
@@ -2059,7 +2057,6 @@ def stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype):
     _free_cuda(lsat_model)
     if is_distributed: dist.barrier()
 
-
 def _cast_trainable_mole_params_to_fp32(peft_model, adapter_names: List[str]):
     """Keep base weights in FP16 while moving trainable MoLE adapters to FP32."""
     base_peft = peft_model.module if hasattr(peft_model, "module") else peft_model
@@ -2120,7 +2117,6 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
             if f".{name}." in n:
                 p.requires_grad_(True)
                 break
-
     _cast_trainable_mole_params_to_fp32(lora_model, adapter_names)
 
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
@@ -2180,17 +2176,29 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     if is_main:
         k_list = sorted(set(args.topk))
-        mO = evaluate_causal(base_eval_model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-O(mole)")
-        mT = evaluate_causal(base_eval_model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-T(mole)")
-        with open(os.path.join(args.output_dir, "metrics_original_mole.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
-        with open(os.path.join(args.output_dir, "metrics_test_mole.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
-        adapter_dir = os.path.join(args.output_dir, "mole_adapters"); ensure_dir(adapter_dir); lora_model.save_pretrained(adapter_dir, selected_adapters=adapter_names)
+        mO = evaluate_causal(base_eval_model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16,
+                             desc="Eval-O(mole)")
+        mT = evaluate_causal(base_eval_model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16,
+                             desc="Eval-T(mole)")
+        with open(os.path.join(args.output_dir, "metrics_original_mole.json"), "w", encoding="utf-8") as f:
+            json.dump(mO, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(args.output_dir, "metrics_test_mole.json"), "w", encoding="utf-8") as f:
+            json.dump(mT, f, ensure_ascii=False, indent=2)
+
+        adapter_dir = os.path.join(args.output_dir, "mole_adapters")
+        ensure_dir(adapter_dir)
+
+        # === FIX: unwrap DDP ===
+        peft_to_save = lora_model.module if hasattr(lora_model, "module") else lora_model
+        peft_to_save.save_pretrained(adapter_dir, selected_adapters=adapter_names)
+
         torch.save({
             'gate_state': base_eval_model.gate.state_dict(),
             'adapter_names': adapter_names,
             'temperature': args.mole_temp,
             'balance_coef': args.mole_balance,
         }, os.path.join(adapter_dir, 'mole_gate.pt'))
+
         print("[Done] MoLE:", mO, mT)
 
     try:
@@ -2344,8 +2352,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/')
-    ap.add_argument('--output_dir', type=str, default='./runs/openP5_yelp')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
+    ap.add_argument('--output_dir', type=str, default='./runs/openP5_ml10M100K')
 
     ap.add_argument('--train_jsonl_path', type=str, default='')
     ap.add_argument('--original_jsonl_path', type=str, default='')
@@ -2354,7 +2362,7 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
     # 新增：阶段控制
-    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='mole',
+    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='raie',
                     help='选择运行阶段')
     ap.add_argument('--resume_base_dir', type=str, default='',
                     help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
