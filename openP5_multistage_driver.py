@@ -43,20 +43,45 @@ def aggressive_gc():
 
 
 def _free_cuda(*objs):
-    """递归释放（包括可能的 .module），然后清理缓存。"""
+    """尽可能释放 GPU 资源并触发垃圾回收。
 
+    注意：`del o` 只会删除本函数内的局部变量名，无法影响 caller 的引用。
+    这里的策略是：
+    1) 尽可能把模型/张量先挪到 CPU，主动释放 GPU 内存；
+    2) 清理可能的 `.module` 包装；
+    3) 触发一次更激进的 GC。
+    """
+
+    seen = set()
     for o in objs:
+        if o is None:
+            continue
+        # 避免重复处理同一对象
+        oid = id(o)
+        if oid in seen:
+            continue
+        seen.add(oid)
+
         try:
-            if o is None:
-                continue
+            # DDP/nn.DataParallel 模型可能带有 .module，优先转成最里层
+            target = o.module if hasattr(o, "module") else o
+
+            # 尽可能把模型/参数移到 CPU，释放 GPU 显存
+            if isinstance(target, torch.nn.Module):
+                try:
+                    target.to("cpu")
+                except Exception:
+                    pass
+
+            # 清理包装引用，降低循环引用概率
             if hasattr(o, "module"):
                 try:
                     delattr(o, "module")
                 except Exception:
                     pass
-            del o
         except Exception:
             pass
+
     aggressive_gc()
 
 
@@ -629,6 +654,10 @@ class MultiStageRunner:
 
         topk_tuple = tuple(sorted(set(self.args.topk)))
 
+        # 初始化阶段内会复用的变量，避免未定义引用阻塞释放
+        base_model = lora_model = mole_model = teacher = bank = replay_buf = base_eval_model = None
+        ft_loader = pred_loader = None
+
         if self.args.mode == "base":
             current_model_dir = self.args.resume_base_dir or os.path.join(
                 self.args.output_dir, "base_with_new_tokens"
@@ -691,6 +720,7 @@ class MultiStageRunner:
             print(f"[Eval][original_stream->original] {initial_original_metrics}")
 
         _free_cuda(initial_model)
+        initial_model = None
 
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
@@ -766,6 +796,9 @@ class MultiStageRunner:
 
                 lora_model, adapter_names, _ = self._load_lora_from_dir(current_model_dir)
                 lora_model = self._finetune_lora(lora_model, ft_loader, replay_buf=replay_buf, teacher=teacher)
+                if teacher is not None:
+                    _free_cuda(teacher)
+                    teacher = None
                 base_eval_model = lora_model if not hasattr(lora_model, "module") else lora_model.module
                 if self.is_main:
                     predict_metrics = self.module.evaluate_causal(
@@ -958,17 +991,23 @@ class MultiStageRunner:
                 print(f"[Eval][{ft_name}->original] {original_metrics}")
 
             stage_objects = [
-                locals().get("base_model"),
-                locals().get("lora_model"),
-                locals().get("mole_model"),
-                locals().get("teacher"),
-                locals().get("bank"),
-                locals().get("replay_buf"),
-                locals().get("base_eval_model"),
-                locals().get("ft_loader"),
-                locals().get("pred_loader"),
+                base_model,
+                lora_model,
+                mole_model,
+                teacher,
+                bank,
+                replay_buf,
+                base_eval_model,
+                ft_loader,
+                pred_loader,
             ]
             _free_cuda(*stage_objects)
+            stage_objects.clear()
+
+            # 显式解除对大对象的引用，避免跨阶段残留
+            base_model = lora_model = mole_model = teacher = bank = replay_buf = base_eval_model = None
+            ft_loader = pred_loader = None
+            aggressive_gc()
 
         if self.is_main:
             self._save_summary(results)
