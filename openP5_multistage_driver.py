@@ -940,7 +940,7 @@ class MultiStageRunner:
 
         # loaders for original evaluation
         self.ds_original = self._make_ds(args.original_jsonl_path or os.path.join(args.data_dir, "original.jsonl"))
-        self.ds_train_stream = self._make_ds(args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl"))
+        self.ds_train_stream = self._make_ds(args.train_jsonl_path or os.path.join(args.data_dir, "original_stream.jsonl"))
         self.original_loader = self._make_loader(self.ds_original, args.batch_size, shuffle=False)
 
         os.makedirs(args.output_dir, exist_ok=True)
