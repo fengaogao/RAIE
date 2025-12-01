@@ -576,8 +576,7 @@ class MultiStageRunner:
             )
             if not os.path.isdir(current_model_dir):
                 raise FileNotFoundError(current_model_dir)
-            base_model = self._load_base_model(current_model_dir)
-            initial_model = base_model
+            initial_model = self._load_base_model(current_model_dir)
         elif self.args.mode == "mole":
             current_model_dir = self.args.default_adapter_dir or os.path.join(
                 self.args.output_dir, "default"
@@ -587,22 +586,19 @@ class MultiStageRunner:
             else:
                 initial_model, _ = self._load_mole_model(current_model_dir)
         else:
-            base_model = self._fresh_lora_model()
-            default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
-            if not os.path.isdir(default_dir):
-                base_model, default_dir = self._train_default_adapter()
-            base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
-            if hasattr(base_model, "set_adapter"):
-                try:
-                    base_model.set_adapter("default")
-                except Exception:
-                    pass
-            initial_model = base_model
-            current_model_dir = default_dir
+            current_model_dir = self.args.default_adapter_dir or os.path.join(
+                self.args.output_dir, "default"
+            )
+            if not os.path.isdir(current_model_dir):
+                initial_model, current_model_dir = self._train_default_adapter()
+            else:
+                initial_model, _, _ = self._load_lora_from_dir(current_model_dir)
 
         results: List[StageResult] = []
         if self.is_main:
             initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
+            if not os.path.exists(initial_pred_path):
+                raise FileNotFoundError(initial_pred_path)
             initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
             initial_predict_metrics = self.module.evaluate_causal(
                 initial_model if not hasattr(initial_model, "module") else initial_model.module,
@@ -640,6 +636,10 @@ class MultiStageRunner:
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
             pred_path = os.path.join(self.args.data_dir, f"{pred_name}.jsonl")
+            if not os.path.exists(ft_path):
+                raise FileNotFoundError(ft_path)
+            if not os.path.exists(pred_path):
+                raise FileNotFoundError(pred_path)
             ft_loader = self._make_loader(ft_path, self.args.finetune_batch_size, shuffle=True, distributed_train=True)
             pred_loader = self._make_loader(pred_path, self.args.batch_size, shuffle=False)
 
