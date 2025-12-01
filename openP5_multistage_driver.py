@@ -4,8 +4,13 @@ import json
 import os
 import shutil
 import types
+import gc
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
+
+# ---------- 环境设置：避免 tokenizer fork 死锁 & CUDA 内存碎片 ----------
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -26,6 +31,33 @@ def _load_openp5_module(path: str) -> types.ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[attr-defined]
     return mod
+
+
+def aggressive_gc():
+    """更强的清理，尽量释放显存碎片。"""
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def _free_cuda(*objs):
+    """递归释放（包括可能的 .module），然后清理缓存。"""
+
+    for o in objs:
+        try:
+            if o is None:
+                continue
+            if hasattr(o, "module"):
+                try:
+                    delattr(o, "module")
+                except Exception:
+                    pass
+            del o
+        except Exception:
+            pass
+    aggressive_gc()
 
 
 @dataclass
@@ -602,6 +634,8 @@ class MultiStageRunner:
             print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
             print(f"[Eval][original_stream->original] {initial_original_metrics}")
 
+        _free_cuda(initial_model)
+
         for idx, (ft_name, pred_name) in enumerate(zip(ft_stages, pred_stages), start=1):
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
@@ -863,10 +897,24 @@ class MultiStageRunner:
                 print(f"[Eval][{ft_name}->{pred_name}] {predict_metrics}")
                 print(f"[Eval][{ft_name}->original] {original_metrics}")
 
+            stage_objects = [
+                locals().get("base_model"),
+                locals().get("lora_model"),
+                locals().get("mole_model"),
+                locals().get("teacher"),
+                locals().get("bank"),
+                locals().get("replay_buf"),
+                locals().get("base_eval_model"),
+                locals().get("ft_loader"),
+                locals().get("pred_loader"),
+            ]
+            _free_cuda(*stage_objects)
+
         if self.is_main:
             self._save_summary(results)
         if self.is_distributed:
             dist.barrier()
+            dist.destroy_process_group()
         return results
 
     # -------------------------------------------------
@@ -959,7 +1007,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    runner = (args)
+    runner = MultiStageRunner(args)
     runner.run()
 
 
