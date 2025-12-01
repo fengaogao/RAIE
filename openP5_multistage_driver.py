@@ -1785,6 +1785,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--default_adapter_dir", type=str, default="")
 
     p.add_argument("--max_history", type=int, default=20)
+    p.add_argument("--item_indexing", type=str, choices=["sequential", "random", "collaborative"], default="sequential")
+    p.add_argument("--min_user_len", type=int, default=5)
     p.add_argument("--final_token_only_loss", action="store_true", default=True)
 
     p.add_argument("--batch_size", type=int, default=128)
