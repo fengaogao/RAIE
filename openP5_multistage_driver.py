@@ -1827,6 +1827,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test_jsonl_path", type=str, default="")
     p.add_argument("--item_ids_path", type=str, default="")
     p.add_argument("--finetune_jsonl_path", type=str, default="")
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
