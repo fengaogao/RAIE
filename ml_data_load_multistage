@@ -95,6 +95,7 @@ def build_examples_multi_stage(
 
     stage_names = ["original", "f1", "f2", "f3", "f4", "test"]
     segments = {name: [] for name in stage_names}
+    original_stride1: List[Dict] = []
     stats = {name: {"users": set(), "items": set(), "interactions": 0} for name in stage_names}
     all_items = set()
 
@@ -149,6 +150,19 @@ def build_examples_multi_stage(
                 all_items.update(ctx)
                 all_items.add(tgt)
 
+            for ctx, tgt, tgt_idx in sliding_windows(mids_o, win_len, 1, align="end"):
+                ts = tss_o[tgt_idx]
+                original_stride1.append(
+                    {
+                        "user_id": uid,
+                        "timestamp": int(ts),
+                        "prompt": " ".join(format_item_token(m) for m in ctx),
+                        "target": format_item_token(tgt),
+                    }
+                )
+                all_items.update(ctx)
+                all_items.add(tgt)
+
         for name, mids_seg, tss_seg in [
             ("f1", mids_f1, tss_f1),
             ("f2", mids_f2, tss_f2),
@@ -185,6 +199,7 @@ def build_examples_multi_stage(
         "boundaries": {"t0": t0, "t1": t1, "t2": t2, "t3": t3, "t4": t4},
         "stats": stats_fmt,
         "quantiles": quantiles,
+        "original_stride1": original_stride1,
     }
 
 
@@ -245,6 +260,7 @@ def main():
 
     for stage, rows in pack["segments"].items():
         save_jsonl(os.path.join(args.output_dir, f"{stage}.jsonl"), rows)
+    save_jsonl(os.path.join(args.output_dir, "original_stride1.jsonl"), pack["original_stride1"])
 
     if args.save_stream:
         t0, t1, t2, t3, t4 = (
@@ -267,7 +283,10 @@ def main():
     with open(os.path.join(args.output_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
-                "counts": {stage: len(rows) for stage, rows in pack["segments"].items()},
+                "counts": {
+                    **{stage: len(rows) for stage, rows in pack["segments"].items()},
+                    "original_stride1": len(pack["original_stride1"]),
+                },
                 "num_items": len(pack["all_items"]),
                 "boundaries": pack["boundaries"],
                 "quantiles": quantiles,
