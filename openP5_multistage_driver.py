@@ -8,7 +8,6 @@ import gc
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
-# ---------- 环境设置：避免 tokenizer fork 死锁 & CUDA 内存碎片 ----------
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -32,10 +31,7 @@ def _load_openp5_module(path: str) -> types.ModuleType:
     spec.loader.exec_module(mod)  # type: ignore[attr-defined]
     return mod
 
-
 def aggressive_gc():
-    """更强的清理，尽量释放显存碎片。"""
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -43,27 +39,16 @@ def aggressive_gc():
 
 
 def _free_cuda(*objs):
-    """尽可能释放 GPU 资源并触发垃圾回收。
-
-    注意：`del o` 只会删除本函数内的局部变量名，无法影响 caller 的引用。
-    这里的策略是：
-    1) 尽可能把模型/张量先挪到 CPU，主动释放 GPU 内存；
-    2) 清理可能的 `.module` 包装；
-    3) 触发一次更激进的 GC。
-    """
-
     seen = set()
     for o in objs:
         if o is None:
             continue
-        # 避免重复处理同一对象
         oid = id(o)
         if oid in seen:
             continue
         seen.add(oid)
 
         try:
-            # DDP/nn.DataParallel 模型可能带有 .module，优先转成最里层
             target = o.module if hasattr(o, "module") else o
 
             # 尽可能把模型/参数移到 CPU，释放 GPU 显存
@@ -72,8 +57,6 @@ def _free_cuda(*objs):
                     target.to("cpu")
                 except Exception:
                     pass
-
-            # 清理包装引用，降低循环引用概率
             if hasattr(o, "module"):
                 try:
                     delattr(o, "module")
@@ -81,7 +64,6 @@ def _free_cuda(*objs):
                     pass
         except Exception:
             pass
-
     aggressive_gc()
 
 
@@ -102,6 +84,7 @@ class MultiStageRunner:
         self._init_distributed()
         # 直接从同目录下的源文件加载，避免因为缺少扩展名导致 importlib 无法解析
         self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE_NEW.py"))
+        self.load_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.device = torch.device(
             f"cuda:{self.local_rank}" if torch.cuda.is_available() and self.local_rank >= 0 else "cuda:0"
             if torch.cuda.is_available()
@@ -109,6 +92,7 @@ class MultiStageRunner:
         )
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
+            torch.backends.cudnn.benchmark = True
         self.is_distributed = dist.is_available() and dist.is_initialized()
         self.is_main = not self.is_distributed or dist.get_rank() == 0
 
@@ -210,7 +194,7 @@ class MultiStageRunner:
                 self.args.lora_r,
                 self.args.lora_alpha,
                 self.args.lora_dropout,
-                torch.float16 if self.args.fp16 else torch.float32,
+                self.load_dtype,
             )
         else:
             # 从原始基座构建，并补全 item tokens 后保存，保证后续阶段可复用
@@ -223,7 +207,7 @@ class MultiStageRunner:
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 low_cpu_mem_usage=True,
-                torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+                torch_dtype=self.load_dtype,
             )
             if hasattr(model.config, "use_cache"):
                 model.config.use_cache = False
@@ -261,7 +245,7 @@ class MultiStageRunner:
         model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+            torch_dtype=self.load_dtype,
         )
         if hasattr(model.config, "use_cache"):
             model.config.use_cache = False
@@ -394,65 +378,6 @@ class MultiStageRunner:
         if self.is_distributed:
             dist.barrier()
         return lora_model, default_dir
-
-    def _train_base_model(self) -> Tuple[torch.nn.Module, str]:
-        """Train a base model with expanded vocab on the original stream.
-
-        Mirrors the Bert4Rec driver behaviour of constructing the starting
-        checkpoint inside the runner when it doesn't exist.
-        """
-
-        print("[Train] base model missing; training on original stream ...")
-        tok = AutoTokenizer.from_pretrained(self.args.model_name_or_path, use_fast=True)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        tok.add_tokens([t for t in self.final_item_tokens if t not in tok.get_vocab()])
-
-        model = AutoModelForCausalLM.from_pretrained(
-            self.args.model_name_or_path,
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
-        )
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
-        model.resize_token_embeddings(len(tok))
-        model.to(self.device)
-
-        model = self._wrap_ddp(model)
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        optim = torch.optim.AdamW(trainable, lr=self.args.lr)
-        total_steps = len(self.stream_loader) * max(self.args.epochs, 1)
-        sched = get_linear_schedule_with_warmup(
-            optim, int(total_steps * self.args.warmup_ratio), total_steps
-        )
-
-        for ep in range(1, self.args.epochs + 1):
-            self._set_epoch(self.stream_loader, ep)
-            loss = self.module.train_one_epoch(
-                model,
-                self.stream_loader,
-                optim,
-                sched,
-                self.device,
-                item_final_token_ids=self.item_final_token_ids,
-                fp16=self.args.fp16,
-                is_main=True,
-                grad_clip=self.args.grad_clip,
-            )
-            if self.is_main:
-                print(f"[Train][base][Epoch {ep}] loss={loss:.4f}")
-
-        base_dir = self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens")
-        if self.is_main:
-            base_eval_model = model.module if hasattr(model, "module") else model
-            base_eval_model.save_pretrained(base_dir)
-            tok.save_pretrained(base_dir)
-        if self.is_distributed:
-            dist.barrier()
-        self.tokenizer = tok
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        return model, base_dir
 
     def _finetune_lora(self, lora_model, ft_loader: DataLoader, replay_buf=None, teacher=None):
         lora_model = self._wrap_ddp(lora_model)
@@ -653,8 +578,6 @@ class MultiStageRunner:
             raise ValueError("--stages must not be empty")
 
         topk_tuple = tuple(sorted(set(self.args.topk)))
-
-        # 初始化阶段内会复用的变量，避免未定义引用阻塞释放
         base_model = lora_model = mole_model = teacher = bank = replay_buf = base_eval_model = None
         ft_loader = pred_loader = None
 
@@ -663,9 +586,9 @@ class MultiStageRunner:
                 self.args.output_dir, "base_with_new_tokens"
             )
             if not os.path.isdir(current_model_dir):
-                initial_model, current_model_dir = self._train_base_model()
-            else:
-                initial_model = self._load_base_model(current_model_dir)
+                raise FileNotFoundError(current_model_dir)
+            base_model = self._load_base_model(current_model_dir)
+            initial_model = base_model
         elif self.args.mode == "mole":
             current_model_dir = self.args.default_adapter_dir or os.path.join(
                 self.args.output_dir, "default"
@@ -675,19 +598,22 @@ class MultiStageRunner:
             else:
                 initial_model, _ = self._load_mole_model(current_model_dir)
         else:
-            current_model_dir = self.args.default_adapter_dir or os.path.join(
-                self.args.output_dir, "default"
-            )
-            if not os.path.isdir(current_model_dir):
-                initial_model, current_model_dir = self._train_default_adapter()
-            else:
-                initial_model, _, _ = self._load_lora_from_dir(current_model_dir)
+            base_model = self._fresh_lora_model()
+            default_dir = self.args.default_adapter_dir or os.path.join(self.args.output_dir, "default")
+            if not os.path.isdir(default_dir):
+                base_model, default_dir = self._train_default_adapter()
+            base_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
+            if hasattr(base_model, "set_adapter"):
+                try:
+                    base_model.set_adapter("default")
+                except Exception:
+                    pass
+            initial_model = base_model
+            current_model_dir = default_dir
 
         results: List[StageResult] = []
         if self.is_main:
             initial_pred_path = os.path.join(self.args.data_dir, f"{ft_stages[0]}.jsonl")
-            if not os.path.exists(initial_pred_path):
-                raise FileNotFoundError(initial_pred_path)
             initial_loader = self._make_loader(initial_pred_path, self.args.batch_size, shuffle=False)
             initial_predict_metrics = self.module.evaluate_causal(
                 initial_model if not hasattr(initial_model, "module") else initial_model.module,
@@ -718,7 +644,6 @@ class MultiStageRunner:
             )
             print(f"[Eval][original_stream->{ft_stages[0]}] {initial_predict_metrics}")
             print(f"[Eval][original_stream->original] {initial_original_metrics}")
-
         _free_cuda(initial_model)
         initial_model = None
 
@@ -726,10 +651,6 @@ class MultiStageRunner:
             print(f"===== Stage {idx}: finetune {ft_name} -> predict {pred_name} =====")
             ft_path = os.path.join(self.args.data_dir, f"{ft_name}.jsonl")
             pred_path = os.path.join(self.args.data_dir, f"{pred_name}.jsonl")
-            if not os.path.exists(ft_path):
-                raise FileNotFoundError(ft_path)
-            if not os.path.exists(pred_path):
-                raise FileNotFoundError(pred_path)
             ft_loader = self._make_loader(ft_path, self.args.finetune_batch_size, shuffle=True, distributed_train=True)
             pred_loader = self._make_loader(pred_path, self.args.batch_size, shuffle=False)
 
@@ -785,7 +706,7 @@ class MultiStageRunner:
                     teacher = AutoModelForCausalLM.from_pretrained(
                         self.args.resume_base_dir or os.path.join(self.args.output_dir, "base_with_new_tokens"),
                         low_cpu_mem_usage=True,
-                        torch_dtype=torch.float16 if self.args.fp16 else torch.float32,
+                        torch_dtype=self.load_dtype,
                     )
                     if hasattr(teacher.config, "use_cache"):
                         teacher.config.use_cache = False
@@ -989,7 +910,6 @@ class MultiStageRunner:
                 )
                 print(f"[Eval][{ft_name}->{pred_name}] {predict_metrics}")
                 print(f"[Eval][{ft_name}->original] {original_metrics}")
-
             stage_objects = [
                 base_model,
                 lora_model,
@@ -1004,7 +924,6 @@ class MultiStageRunner:
             _free_cuda(*stage_objects)
             stage_objects.clear()
 
-            # 显式解除对大对象的引用，避免跨阶段残留
             base_model = lora_model = mole_model = teacher = bank = replay_buf = base_eval_model = None
             ft_loader = pred_loader = None
             aggressive_gc()
@@ -1013,7 +932,6 @@ class MultiStageRunner:
             self._save_summary(results)
         if self.is_distributed:
             dist.barrier()
-            dist.destroy_process_group()
         return results
 
     # -------------------------------------------------
@@ -1057,12 +975,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume_base_dir", type=str, default="")
     p.add_argument("--default_adapter_dir", type=str, default="")
 
-    p.add_argument("--max_history", type=int, default=20)
+    p.add_argument("--max_history", type=int, default=10)
     p.add_argument("--item_indexing", type=str, choices=["sequential", "random", "collaborative"], default="sequential")
     p.add_argument("--min_user_len", type=int, default=5)
     p.add_argument("--final_token_only_loss", action="store_true", default=True)
 
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--finetune_batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--finetune_epochs", type=int, default=3)
