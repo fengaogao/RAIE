@@ -204,6 +204,13 @@ class MultiRoundPredictor:
     # -------------------------------------------------
     # Execution
     # -------------------------------------------------
+    def _barrier_if_distributed(self):
+        if self.is_distributed:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+
     def run_method(self, method: str):
         method = method.lower()
         if method not in {"lora", "replay", "lwf", "lsat", "raie", "mole"}:
@@ -232,8 +239,10 @@ class MultiRoundPredictor:
             if method == "raie" and self.is_distributed and dist.get_rank() != 0:
                 if self.is_main:
                     print(f"[INFO] Skip RAIE on non-zero rank {dist.get_rank()}")
+                self._barrier_if_distributed()
                 continue
 
+            self._barrier_if_distributed()
             stage_fn(
                 round_args,
                 device=self.device,
@@ -242,6 +251,7 @@ class MultiRoundPredictor:
                 is_main=self.is_main,
                 load_dtype=self.load_dtype,
             )
+            self._barrier_if_distributed()
 
             prev_dir = round_dir
             resume_base = (
