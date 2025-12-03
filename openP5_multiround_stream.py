@@ -20,7 +20,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # -------------------------------------------------
 
 def _load_openp5_module(path: str) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("openP5_RAIE", path)
+    spec = importlib.util.spec_from_file_location("openP5_RAIE_NEW.py", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {path}")
     mod = importlib.util.module_from_spec(spec)
@@ -74,7 +74,7 @@ class MultiRoundPredictor:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE.py"))
+        self.module = _load_openp5_module(os.path.join(os.path.dirname(__file__), "openP5_RAIE_NEW.py"))
         self._init_distributed()
         self.device = torch.device(
             f"cuda:{self.local_rank}" if torch.cuda.is_available() and self.local_rank >= 0 else "cuda:0"
@@ -135,12 +135,39 @@ class MultiRoundPredictor:
     # Base prep + cloning
     # -------------------------------------------------
     def _prepare_base_once(self):
+        """
+        O 阶段基座初始化：
+        - 训练集：args.train_jsonl_path        (original_stream.jsonl)
+        - 测试集1：rounds[0].finetune_jsonl_path   (例如 f1.jsonl)
+        - 测试集2：args.original_jsonl_path   (original.jsonl，由 stage_pre 内部使用)
+        """
+        # 已经有基座就直接复用
         if os.path.isdir(os.path.join(self.base_output, "base_with_new_tokens")):
             return
+
+        # Safety：必须提供 original_stream 和至少一个 round
+        if not self.args.train_jsonl_path:
+            raise ValueError(
+                "train_jsonl_path (e.g., original_stream.jsonl) must be provided "
+                "for base preparation (O 阶段训练集)."
+            )
+        if not self.rounds:
+            raise ValueError("No rounds defined; finetune_rounds must contain at least one path.")
+
         base_args = copy.deepcopy(self.args)
         base_args.output_dir = self.base_output
-        base_args.finetune_jsonl_path = self.rounds[0].finetune_jsonl_path if self.rounds else base_args.finetune_jsonl_path
-        base_args.test_jsonl_path = self.rounds[0].test_jsonl_path if self.rounds else base_args.test_jsonl_path
+
+        # O 阶段训练集：original_stream.jsonl
+        base_args.train_jsonl_path = self.args.train_jsonl_path
+        # 为兼容旧接口，如果 stage_pre 仍使用 finetune_jsonl_path 作为训练入口，这里也同步一下
+        base_args.finetune_jsonl_path = self.args.train_jsonl_path
+
+        # O 阶段测试集 1：第一个 round 的 finetune（f1.jsonl）
+        base_args.test_jsonl_path = self.rounds[0].finetune_jsonl_path
+
+        # O 阶段测试集 2：original.jsonl（稳定原始评估集）
+        base_args.original_jsonl_path = self.args.original_jsonl_path
+
         self.module.stage_pre(
             base_args,
             device=self.device,
@@ -154,9 +181,13 @@ class MultiRoundPredictor:
     def _clone_args_for_round(args: argparse.Namespace, spec: RoundSpec, output_dir: str, resume_base: str) -> argparse.Namespace:
         new_args = copy.deepcopy(args)
         new_args.output_dir = output_dir
+        # F 阶段：每轮的 finetune 集（f_k.jsonl）
         new_args.finetune_jsonl_path = spec.finetune_jsonl_path
+        # T 阶段测试 1：对应的 test_rounds（通常是 f_{k+1}.jsonl 或 test.jsonl）
         new_args.test_jsonl_path = spec.test_jsonl_path
+        # T 阶段测试 2：original.jsonl
         new_args.original_jsonl_path = spec.original_jsonl_path
+        # 基座：上一轮的 base_with_new_tokens
         new_args.resume_base_dir = resume_base
         return new_args
 
@@ -178,6 +209,7 @@ class MultiRoundPredictor:
         if method not in {"lora", "replay", "lwf", "lsat", "raie", "mole"}:
             raise ValueError(f"Unsupported method: {method}")
 
+        # 只在最开始跑一次 O 阶段
         self._prepare_base_once()
         resume_base = os.path.join(self.base_output, "base_with_new_tokens")
         prev_dir = self.base_output
@@ -212,7 +244,11 @@ class MultiRoundPredictor:
             )
 
             prev_dir = round_dir
-            resume_base = os.path.join(round_dir, "base_with_new_tokens") if os.path.isdir(os.path.join(round_dir, "base_with_new_tokens")) else resume_base
+            resume_base = (
+                os.path.join(round_dir, "base_with_new_tokens")
+                if os.path.isdir(os.path.join(round_dir, "base_with_new_tokens"))
+                else resume_base
+            )
 
     def close(self):
         aggressive_gc()
@@ -234,14 +270,15 @@ class MultiRoundPredictor:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K_multistage/')
     ap.add_argument('--output_dir', type=str, default='./runs/openP5_multiround')
 
-    ap.add_argument('--train_jsonl_path', type=str, default='')
-    ap.add_argument('--original_jsonl_path', type=str, default='')
-    ap.add_argument('--test_jsonl_path', type=str, default='')
-    ap.add_argument('--item_ids_path', type=str, default='')
-    ap.add_argument('--finetune_jsonl_path', type=str, default='')
+    ap.add_argument('--train_jsonl_path', type=str, default='/home/zj/code/ml-10M100K_multistage/original_stride1.jsonl')         # original_stream.jsonl
+    ap.add_argument('--original_jsonl_path', type=str, default='/home/zj/code/ml-10M100K_multistage/original.jsonl')      # original.jsonl
+    ap.add_argument('--finetune_jsonl_path', type=str, default='/home/zj/code/ml-10M100K_multistage/f1.jsonl')
+    ap.add_argument('--test_jsonl_path', type=str, default='/home/zj/code/ml-10M100K_multistage/f2.jsonl')
+    ap.add_argument('--item_ids_path', type=str, default='/home/zj/code/ml-10M100K_multistage/item_ids.json')
+
 
     ap.add_argument('--item_indexing', type=str, choices=['sequential', 'random', 'collaborative'], default='sequential')
     ap.add_argument('--min_user_len', type=int, default=5)
