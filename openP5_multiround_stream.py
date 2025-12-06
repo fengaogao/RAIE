@@ -236,21 +236,20 @@ class MultiRoundPredictor:
                 "mole": self.module.stage_mole,
             }[method]
 
-            if method == "raie" and self.is_distributed and dist.get_rank() != 0:
-                if self.is_main:
-                    print(f"[INFO] Skip RAIE on non-zero rank {dist.get_rank()}")
-                self._barrier_if_distributed()
-                continue
+            skip_stage = method == "raie" and self.is_distributed and dist.get_rank() != 0
+            if skip_stage and self.is_main:
+                print(f"[INFO] Skip RAIE on non-zero rank {dist.get_rank()}")
 
             self._barrier_if_distributed()
-            stage_fn(
-                round_args,
-                device=self.device,
-                is_distributed=self.is_distributed if method != "raie" else False,
-                local_rank=self.local_rank,
-                is_main=self.is_main,
-                load_dtype=self.load_dtype,
-            )
+            if not skip_stage:
+                stage_fn(
+                    round_args,
+                    device=self.device,
+                    is_distributed=self.is_distributed if method != "raie" else False,
+                    local_rank=self.local_rank,
+                    is_main=self.is_main,
+                    load_dtype=self.load_dtype,
+                )
             self._barrier_if_distributed()
 
             prev_dir = round_dir
