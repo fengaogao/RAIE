@@ -511,7 +511,7 @@ def ce_loss_on_items(model, batch, device, item_final_token_ids: List[int], fp16
     logits_q = logits[rows, query_pos, :]
     item_ids = torch.tensor(item_final_token_ids, device=device)
     scores = logits_q.index_select(dim=1, index=item_ids)
-    loss = F.cross_entropy(scores, lab)
+    loss = F.cross_entropy(scores.float(), lab)
     return loss, scores
 
 # ------------------------------
@@ -523,7 +523,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
                     label_smoothing: float = 0.0):
     model.train()
     total = 0.0
-    use_amp = amp_enabled_for_model(model, fp16)
+    use_amp = fp16 and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     item_ids = torch.tensor(item_final_token_ids, device=device)
 
@@ -541,9 +541,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
             scores = logits_q.index_select(dim=1, index=item_ids)
             gold   = batch["target_item_idx"]
             try:
-                loss = F.cross_entropy(scores, gold, label_smoothing=label_smoothing)
+                loss = F.cross_entropy(scores.float(), gold, label_smoothing=label_smoothing)
             except TypeError:
-                loss = F.cross_entropy(scores, gold)
+                loss = F.cross_entropy(scores.float(), gold)
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -642,7 +642,7 @@ def finetune_one_epoch_lora(
     teacher=None, lwf_T: float = 2.0, lwf_alpha: float = 0.5,
 ):
     lora_model.train()
-    use_amp = amp_enabled_for_model(lora_model, fp16)
+    use_amp = fp16 and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc=f"Finetune(F)-{plugin}"), start=1):
@@ -756,7 +756,7 @@ class MoLEMixtureCausal(nn.Module):
             mask_vec[self.item_final_token_ids] = 0.0
             logits_q = logits_q + mask_vec
 
-            base_loss = F.cross_entropy(logits_q, target_labels)
+            base_loss = F.cross_entropy(logits_q.float(), target_labels)
             balance_loss = torch.tensor(0.0, device=input_ids.device)
             if self.balance_coef > 0:
                 avg_gate = gate_weights.mean(dim=0)
@@ -778,7 +778,7 @@ def finetune_one_epoch_mole(
     log_every: int = 100,
 ):
     mole_model.train()
-    use_amp = amp_enabled_for_model(mole_model, fp16)
+    use_amp = fp16 and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
@@ -902,7 +902,7 @@ def finetune_one_epoch_causal_anchor(
     嵌入正则/Hook 在 embed_model（unwrap 后模块）上做。
     """
     model.train()
-    use_amp = amp_enabled_for_model(model, fp16)
+    use_amp = fp16 and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for batch in tqdm(finetune_loader, desc="Finetune(F)-Anchor"):
@@ -1693,6 +1693,8 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
             json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
             json.dump(mT, f, ensure_ascii=False, indent=2)
+    if is_distributed:
+        dist.barrier()
 
     # 保存 default 适配器 + 生成干净 base（带新 vocab） + mid2idx.json
     if is_main and args.use_lora:
@@ -1714,6 +1716,8 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         print(f"[SAVE] clean base saved to {base_dir}")
         # 保存 mid2idx
         save_mid2idx(os.path.join(args.output_dir, "mid2idx.json"), mid2idx)
+    if is_distributed:
+        dist.barrier()
     try:
         del optimizer, scheduler
     except Exception:
@@ -2352,8 +2356,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
-    ap.add_argument('--output_dir', type=str, default='./runs/openP5_ml10M100K')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/')
+    ap.add_argument('--output_dir', type=str, default='./runs/openP5_Amazon_electronics')
 
     ap.add_argument('--train_jsonl_path', type=str, default='')
     ap.add_argument('--original_jsonl_path', type=str, default='')
@@ -2362,7 +2366,7 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
     # 新增：阶段控制
-    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='raie',
+    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='lwf',
                     help='选择运行阶段')
     ap.add_argument('--resume_base_dir', type=str, default='',
                     help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
@@ -2371,7 +2375,7 @@ def main():
 
     ap.add_argument('--item_indexing', type=str, choices=['sequential', 'random', 'collaborative'], default='sequential')
     ap.add_argument('--min_user_len', type=int, default=5)
-    ap.add_argument('--max_history', type=int, default=20)
+    ap.add_argument('--max_history', type=int, default=10)
 
     # 训练
     ap.add_argument('--epochs', type=int, default=5)
@@ -2416,7 +2420,7 @@ def main():
     ap.add_argument("--tau", type=float, default=0.05)
     ap.add_argument("--gamma", type=float, default=0.5)
     ap.add_argument("--gap_thr", type=float, default=0.02)
-    ap.add_argument("--orig_mix_ratio", type=float, default=0.3)
+    ap.add_argument("--orig_mix_ratio", type=float, default=0.5)
     ap.add_argument("--soft_rep_factor", type=int, default=2)
     ap.add_argument("--raie_epochs_per_region", type=int, default=3)
     ap.add_argument("--lambda_anchor", type=float, default=1e-4)
