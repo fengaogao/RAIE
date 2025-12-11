@@ -767,6 +767,12 @@ def evaluate_llara_dataset(llm, tok, sr2llm, item_table, dataset: LLaRADatasetFr
                            idx2title: List[str], k_list, device, fp16=False, is_main=True, max_eval=None):
     if not is_main:
         return None
+    # 确保评测时关闭 dropout 等训练态
+    prev_llm_mode = llm.training
+    prev_sr_mode = sr2llm.training if hasattr(sr2llm, "training") else None
+    llm.eval()
+    if hasattr(sr2llm, "eval"):
+        sr2llm.eval()
     K_list = sorted(set(k_list))
     sums = {f"Recall@{k}":0.0 for k in K_list}
     sums.update({f"NDCG@{k}":0.0 for k in K_list})
@@ -809,8 +815,15 @@ def evaluate_llara_dataset(llm, tok, sr2llm, item_table, dataset: LLaRADatasetFr
             sums[f"Recall@{k}"] += 1.0 if rank <= k else 0.0
             sums[f"NDCG@{k}"]   += (0.0 if rank > k else 1.0 / math.log2(rank + 1))
         n += 1
+    metrics = {k: (v / max(1, n)) for k, v in sums.items()}
 
-    return {k: (v / max(1, n)) for k, v in sums.items()}
+    # 还原训练/评测模式
+    if prev_llm_mode:
+        llm.train()
+    if prev_sr_mode is not None:
+        if prev_sr_mode:
+            sr2llm.train()
+    return metrics
 
 
 @torch.no_grad()
@@ -892,6 +905,11 @@ def evaluate_llara_raie(llm_peft, adapter_names: List[str], tok, sr2llm, item_ta
                         fp16=False, is_main=True, max_eval=None):
     if not is_main:
         return None
+    prev_llm_mode = llm_peft.training
+    prev_sr_mode = sr2llm.training if hasattr(sr2llm, "training") else None
+    llm_peft.eval()
+    if hasattr(sr2llm, "eval"):
+        sr2llm.eval()
     base = llm_peft.module if hasattr(llm_peft, "module") else llm_peft
     K_list = sorted(set(k_list))
     sums = {f"Recall@{k}":0.0 for k in K_list}
@@ -935,8 +953,14 @@ def evaluate_llara_raie(llm_peft, adapter_names: List[str], tok, sr2llm, item_ta
             sums[f"Recall@{k}"] += 1.0 if rank <= k else 0.0
             sums[f"NDCG@{k}"]   += (0.0 if rank > k else 1.0 / math.log2(rank + 1))
         n += 1
+    metrics = {k: (v / max(1, n)) for k, v in sums.items()}
 
-    return {k: (v / max(1, n)) for k, v in sums.items()}
+    if prev_llm_mode:
+        llm_peft.train()
+    if prev_sr_mode is not None:
+        if prev_sr_mode:
+            sr2llm.train()
+    return metrics
 
 
 # ------------------------------
