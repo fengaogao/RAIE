@@ -718,6 +718,16 @@ def score_candidates_llm_batched(llm, tok, prompt_ids, prompt_attn, prompt_embed
         out_p = base(inputs_embeds=prompt_embeds, attention_mask=prompt_attn, use_cache=True)
     pkv = out_p.past_key_values
 
+    # 在新版本 transformers 中，模型需要 Cache 对象而不是 tuple。
+    # 这里兼容旧缓存格式，避免 AttributeError: 'tuple' object has no attribute 'get_seq_length'.
+    try:
+        from transformers.cache_utils import DynamicCache
+    except Exception:
+        DynamicCache = None
+
+    if isinstance(pkv, tuple) and DynamicCache is not None:
+        pkv = DynamicCache.from_legacy_cache(pkv)
+
     scores = []
     # 分块批处理候选，避免显存爆
     for i in range(0, len(cand_token_ids), chunk_size):
@@ -734,6 +744,11 @@ def score_candidates_llm_batched(llm, tok, prompt_ids, prompt_attn, prompt_embed
 
         # 复制/扩展 prompt 的 KV 到 batch 维
         def _tile_pkv(pkv, times):
+            # 新 cache 接口提供了批量复制方法
+            if hasattr(pkv, "batch_repeat_interleave"):
+                return pkv.batch_repeat_interleave(times)
+
+            # 兼容旧 tuple 缓存格式
             new = []
             for layer in pkv:
                 k, v = layer[0], layer[1]
