@@ -779,7 +779,8 @@ def recall_ndcg_from_ranks(rank: int, K_list=(5,10,20)):
 
 @torch.no_grad()
 def evaluate_llara_dataset(llm, tok, sr2llm, item_table, dataset: LLaRADatasetFromJsonl,
-                           idx2title: List[str], k_list, device, fp16=False, is_main=True, max_eval=None):
+                           idx2title: List[str], k_list, device, fp16=False, is_main=True,
+                           max_eval=None, cand_chunk_size: int = 256):
     if not is_main:
         return None
     # 确保评测时关闭 dropout 等训练态
@@ -817,7 +818,7 @@ def evaluate_llara_dataset(llm, tok, sr2llm, item_table, dataset: LLaRADatasetFr
         # 3) 从缓存中取候选分词，批量打分（KV cache）
         cand_token_ids = [title_token_cache[i] for i in cand_ids]
         scores = score_candidates_llm_batched(llm, tok, p_ids, p_attn, p_emb,
-                                              cand_token_ids, device, fp16=fp16, chunk_size=256)
+                                              cand_token_ids, device, fp16=fp16, chunk_size=cand_chunk_size)
 
         # 4) 本地排序转名次
         order_local = np.argsort(scores)[::-1]
@@ -917,7 +918,7 @@ def split_dataset_by_region(ds_F: 'LLaRADatasetFromJsonl',
 @torch.no_grad()
 def evaluate_llara_raie(llm_peft, adapter_names: List[str], tok, sr2llm, item_table, dataset: 'LLaRADatasetFromJsonl',
                         idx2title: List[str], k_list, device, centers_cpu: torch.Tensor,
-                        fp16=False, is_main=True, max_eval=None):
+                        fp16=False, is_main=True, max_eval=None, cand_chunk_size: int = 256):
     if not is_main:
         return None
     prev_llm_mode = llm_peft.training
@@ -958,7 +959,7 @@ def evaluate_llara_raie(llm_peft, adapter_names: List[str], tok, sr2llm, item_ta
 
         cand_token_ids = [title_token_cache[i] for i in cand_ids]
         scores = score_candidates_llm_batched(base, tok, p_ids, p_attn, p_emb,
-                                              cand_token_ids, device, fp16=fp16, chunk_size=256)
+                                              cand_token_ids, device, fp16=fp16, chunk_size=cand_chunk_size)
 
         order_local = np.argsort(scores)[::-1]
         ranked_ids = np.array(cand_ids)[order_local]
@@ -1201,8 +1202,12 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         barrier_gloo()
     if is_main:
         k_list = sorted(set(args.topk))
-        mO = evaluate_llara_dataset(model, tok, sr2llm, item_table.to(device), ld_O, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
-        mT = evaluate_llara_dataset(model, tok, sr2llm, item_table.to(device), ld_T, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+        mO = evaluate_llara_dataset(model, tok, sr2llm, item_table.to(device), ld_O, idx2title, k_list, device,
+                                    fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval,
+                                    cand_chunk_size=args.eval_chunk_size)
+        mT = evaluate_llara_dataset(model, tok, sr2llm, item_table.to(device), ld_T, idx2title, k_list, device,
+                                    fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval,
+                                    cand_chunk_size=args.eval_chunk_size)
         with open(os.path.join(args.output_dir, "metrics_original.json"), "w", encoding="utf-8") as f:
             json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
@@ -1343,9 +1348,11 @@ def stage_lora(args, device, is_distributed, local_rank, is_main, load_dtype):
         base_eval_model = lora_model.module if hasattr(lora_model, "module") else lora_model
         k_list = sorted(set(args.topk))
         mO = evaluate_llara_dataset(base_eval_model, tok_lora, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
-                                    item_table.to(device), ds_O, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                    item_table.to(device), ds_O, idx2title, k_list, device, fp16=args.fp16, is_main=True,
+                                    max_eval=args.max_eval_eval, cand_chunk_size=args.eval_chunk_size)
         mT = evaluate_llara_dataset(base_eval_model, tok_lora, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
-                                    item_table.to(device), ds_T, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                    item_table.to(device), ds_T, idx2title, k_list, device, fp16=args.fp16, is_main=True,
+                                    max_eval=args.max_eval_eval, cand_chunk_size=args.eval_chunk_size)
         with open(os.path.join(args.output_dir, "metrics_original_lora.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test_lora.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
         save_lora = os.path.join(args.output_dir, "lora_adapter_lora"); ensure_dir(save_lora); base_eval_model.save_pretrained(save_lora)
@@ -1425,9 +1432,11 @@ def stage_replay(args, device, is_distributed, local_rank, is_main, load_dtype):
         base_eval_model = rep_model.module if hasattr(rep_model, "module") else rep_model
         k_list = sorted(set(args.topk))
         mO = evaluate_llara_dataset(base_eval_model, tok_rep, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
-                                    item_table.to(device), ds_O, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                    item_table.to(device), ds_O, idx2title, k_list, device, fp16=args.fp16, is_main=True,
+                                    max_eval=args.max_eval_eval, cand_chunk_size=args.eval_chunk_size)
         mT = evaluate_llara_dataset(base_eval_model, tok_rep, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
-                                    item_table.to(device), ds_T, idx2title, k_list, device, fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                    item_table.to(device), ds_T, idx2title, k_list, device, fp16=args.fp16, is_main=True,
+                                    max_eval=args.max_eval_eval, cand_chunk_size=args.eval_chunk_size)
         with open(os.path.join(args.output_dir, "metrics_original_lora_replay.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test_lora_replay.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
         save_lora = os.path.join(args.output_dir, "lora_adapter_lora_replay"); ensure_dir(save_lora); base_eval_model.save_pretrained(save_lora)
@@ -1590,10 +1599,12 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         k_list = sorted(set(args.topk))
         mO = evaluate_llara_raie(peft_model, loaded_names, tok, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
                                  item_table, ds_O, idx2title, k_list, device, centers_cpu,
-                                 fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                 fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval,
+                                 cand_chunk_size=args.eval_chunk_size)
         mT = evaluate_llara_raie(peft_model, loaded_names, tok, (sr2llm.module if hasattr(sr2llm,"module") else sr2llm),
                                  item_table, ds_T, idx2title, k_list, device, centers_cpu,
-                                 fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval)
+                                 fp16=args.fp16, is_main=True, max_eval=args.max_eval_eval,
+                                 cand_chunk_size=args.eval_chunk_size)
         with open(os.path.join(args.output_dir, "metrics_original_raie.json"), "w", encoding="utf-8") as f: json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test_raie.json"), "w", encoding="utf-8") as f: json.dump(mT, f, ensure_ascii=False, indent=2)
         print("[Done] RAIE:", mO, mT)
@@ -1618,6 +1629,8 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
     ap.add_argument('--eval_prefilter', type=int, default=300,
                     help='prefilter top-M candidates per example before LLM ranking')
+    ap.add_argument('--eval_chunk_size', type=int, default=64,
+                    help='candidate scoring batch size per prompt during evaluation')
 
     # 新增：阶段控制
     ap.add_argument('--stage', type=str, choices=['pre','lora','replay','raie','all'], default='pre',
