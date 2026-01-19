@@ -529,7 +529,8 @@ class MoLEMixture(nn.Module):
                 neg: Optional[torch.Tensor] = None, return_loss: bool = False):
         emb = self.model.item_emb(seq_ids)
         mask = (seq_ids != 0).unsqueeze(-1)
-        pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        mask_sum = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+        pooled = (emb * mask).sum(dim=1) / mask_sum  # [B, D]
         gate_logits = self.gate(pooled) / self.temperature
         gate_weights = F.softmax(gate_logits, dim=-1)
 
@@ -1166,16 +1167,16 @@ class RegionBankSASRec:
 # =========================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='lora_lwf',
+    parser.add_argument('--mode', type=str, default='raie',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
                         help='七种方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
-    parser.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/',
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_toys/',
                         help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
-    parser.add_argument('--output_dir', type=str, default='./runs/sasrec_yelp')
+    parser.add_argument('--output_dir', type=str, default='./runs/sasrec_Amazon_toys')
 
     # Seq / vocab
     parser.add_argument('--min_user_len', type=int, default=5)
-    parser.add_argument('--maxlen', type=int, default=50)
+    parser.add_argument('--maxlen', type=int, default=20)
 
     # Model
     parser.add_argument('--hidden_units', type=int, default=128)
@@ -1212,17 +1213,17 @@ def main():
     parser.add_argument('--lora_target', type=str, default='q_proj,k_proj,v_proj,out_proj,linear1,linear2')
 
     # MoLE
-    parser.add_argument('--mole_num_experts', type=int, default=4, help='Number of LoRA experts for MoLE')
+    parser.add_argument('--mole_num_experts', type=int, default=3, help='Number of LoRA experts for MoLE')
     parser.add_argument('--mole_gating_hidden', type=int, default=128, help='Hidden size of MoLE gating network')
     parser.add_argument('--mole_temp', type=float, default=0.7, help='Temperature for MoLE gating softmax')
     parser.add_argument('--mole_balance', type=float, default=0.01, help='KL weight to balance MoLE expert usage')
 
     # RAIE
-    parser.add_argument('--K', type=int, default=10)
+    parser.add_argument('--K', type=int, default=3)
     parser.add_argument('--q', type=float, default=0.9)
     parser.add_argument('--beta_post', type=float, default=8.0)
     parser.add_argument('--delta_min', type=float, default=0.05)
-    parser.add_argument('--orig_mix_ratio', type=float, default=0.3)
+    parser.add_argument('--orig_mix_ratio', type=float, default=0.7)
     parser.add_argument('--lam_new', type=float, default=-1.0)
 
     # Eval
@@ -1235,7 +1236,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
-    device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # ===== 数据 =====
     train_seq, n_items, id2idx = load_train_sequences_from_stream(args.data_dir, min_user_len=args.min_user_len)
@@ -1247,6 +1248,12 @@ def main():
     test_rows = read_jsonl(test_path)
     eval_ds = EvalWindowDataset(test_rows, id2idx, maxlen=args.maxlen)
     eval_loader = DataLoader(eval_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
+
+    original_path = os.path.join(args.data_dir, "original.jsonl")
+    if not os.path.exists(original_path): raise FileNotFoundError(original_path)
+    original_rows = read_jsonl(original_path)
+    original_ds = EvalWindowDataset(original_rows, id2idx, maxlen=args.maxlen)
+    original_loader = DataLoader(original_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
 
     # ===== 模型（O-stage）=====
     base_model = SASRec(
@@ -1271,6 +1278,8 @@ def main():
     # 测试 base（统一风格）
     topk_tuple = tuple(int(x) for x in args.topk.split(','))
     if args.mode == 'base':
+        original_metrics = evaluate_windows(base_model, original_loader, n_items, list(topk_tuple), device)
+        print("[original][base]", ' '.join([f"{k}:{v:.6f}" for k,v in sorted(original_metrics.items())]))
         metrics = evaluate_windows(base_model, eval_loader, n_items, list(topk_tuple), device)
         print("[Test][base]", ' '.join([f"{k}:{v:.6f}" for k,v in sorted(metrics.items())]))
         with open(os.path.join(args.output_dir, "test_metrics_base.json"), "w", encoding="utf-8") as f:
@@ -1358,6 +1367,13 @@ def main():
                     print(f"[LSAT][Short][Epoch {ep}] loss={ft_loss:.4f}")
 
                 if emb_hook is not None: emb_hook.remove()
+                original_metrics = evaluate_lsat(
+                    lora_model, original_loader, n_items, list(topk_tuple), device,
+                    long_adapter=long_adapter, short_adapter=short_adapter,
+                    alpha=args.lsat_alpha, exclude_seen=True
+                )
+                tag = args.mode
+                print(f"[original][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
 
                 metrics = evaluate_lsat(
                     lora_model, eval_loader, n_items, list(topk_tuple), device,
@@ -1421,6 +1437,10 @@ def main():
             eval_model = lora_model
 
         # 测试
+        original_metrics = evaluate_windows(eval_model, original_loader, n_items, list(topk_tuple), device)
+        tag = args.mode
+        print(f"[original][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
+
         metrics = evaluate_windows(eval_model, eval_loader, n_items, list(topk_tuple), device)
         tag = args.mode
         print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(metrics.items())]))
@@ -1469,6 +1489,8 @@ def main():
             )
             print(f"[MoLE][Epoch {ep}] loss={ft_loss:.4f}")
 
+        original_metrics = evaluate_windows(mole_model, original_loader, n_items, list(topk_tuple), device)
+        print(f"[original][mole]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
         metrics = evaluate_windows(mole_model, eval_loader, n_items, list(topk_tuple), device)
         print(f"[Test][mole]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(metrics.items())]))
         with open(os.path.join(args.output_dir, 'test_metrics_mole.json'), 'w', encoding='utf-8') as f:
@@ -1499,7 +1521,7 @@ def main():
         original_rows_for_mix = read_jsonl(path_stride1)
     else:
         original_prompts = PromptDatasetFromStreamStride1(os.path.join(args.data_dir, "original_stream.jsonl"))
-        original_rows_for_mix = [{"prompt": " ".join(ex.prompt_tokens), "target": ex.target_token}
+        original_rows_for_mix = [{"prompt": "".join(ex.prompt_tokens), "target": ex.target_token}
                                  for ex in original_prompts.examples]
 
     bank = RegionBankSASRec(
