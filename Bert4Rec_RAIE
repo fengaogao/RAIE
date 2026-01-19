@@ -1456,16 +1456,15 @@ def evaluate_lsat(
 # =========================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='mole',
+    parser.add_argument('--mode', type=str, default='raie',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
                         help='7种方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
-    parser.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/',
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/',
                         help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl(or original.jsonl), item_ids.json')
-    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_ml-10M100K')
+    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_yelp')
 
     # Sequence / vocab
     parser.add_argument('--max_len', type=int, default=20, help='Length of prompt (without [CLS])')
-
     # Model
     parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument('--num_hidden_layers', type=int, default=4)
@@ -1551,8 +1550,10 @@ def main():
     # Datasets
     train_path = os.path.join(args.data_dir, 'original_stream.jsonl')
     finetune_path = os.path.join(args.data_dir, 'finetune.jsonl')
-    test_path_tgt = os.path.join(args.data_dir, 'original.jsonl')
-    test_path_alt = os.path.join(args.data_dir, 'original.jsonl')  # fallback
+    original_path_tgt = os.path.join(args.data_dir, 'original.jsonl')
+    original_path_alt = os.path.join(args.data_dir, 'original.jsonl')
+    test_path_tgt = os.path.join(args.data_dir, 'test.jsonl')
+    test_path_alt = os.path.join(args.data_dir, 'test.jsonl')
     if not os.path.exists(train_path):
         raise FileNotFoundError('Missing original_stream.jsonl in data_dir')
 
@@ -1563,6 +1564,7 @@ def main():
 
     train_ds = StreamDataset(train_path)
     finetune_ds = NextItemDataset(finetune_path) if os.path.exists(finetune_path) else None
+    orig_ds = NextItemDataset(original_path_tgt)
     test_ds = NextItemDataset(test_path)
 
     # RAIE 需要 original_stride1.jsonl（若缺失，用 original.jsonl 回退）
@@ -1583,6 +1585,8 @@ def main():
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2,
                               collate_fn=train_collator)
+    orig_loader = DataLoader(orig_ds, batch_size=args.batch_size, shuffle=False, num_workers=2,
+                             collate_fn=eval_collator)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2,
                              collate_fn=eval_collator)
 
@@ -1600,7 +1604,7 @@ def main():
         attention_probs_dropout_prob=args.dropout,
         pad_token_id=pad_id,
     )
-    device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     base_model = BertForMaskedLM(config).to(device)
 
     # O-stage optimizer & scheduler
@@ -1642,11 +1646,13 @@ def main():
     # ---------- 方案1：base ----------
     if args.mode == 'base':
         print("[Mode] base: O-stage only, no LoRA / plugins")
+        ori_metrics = evaluate(base_model, orig_loader, device, item_token_ids, topk=topk_tuple)
         metrics = evaluate(base_model, test_loader, device, item_token_ids, topk=topk_tuple)
+        print("[Original][base]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(ori_metrics.items())]))
         print("[Test][base]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
-        with open(os.path.join(args.output_dir, 'test_metrics_base.json'), 'w', encoding='utf-8') as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-        return
+        # with open(os.path.join(args.output_dir, 'test_metrics_base.json'), 'w', encoding='utf-8') as f:
+        #     json.dump(metrics, f, ensure_ascii=False, indent=2)
+        # return
 
     # ---------- 公共：LoRA 包装（2~4 & RAIE 均需） ----------
     target_modules = [s.strip() for s in args.lora_target.split(',') if s.strip()]
@@ -1720,13 +1726,18 @@ def main():
                         grad_clip=args.grad_clip, replay_ratio=args.replay_ratio, log_every=100
                     )
                     print(f"[LSAT][Short][Epoch {ep}] loss={ft_loss:.4f}")
-
+                orig_metrics = evaluate_lsat(
+                    lora_model, orig_loader, device, item_token_ids,
+                    long_adapter=long_adapter, short_adapter=short_adapter,
+                    alpha=args.lsat_alpha, topk=topk_tuple
+                )
                 metrics = evaluate_lsat(
                     lora_model, test_loader, device, item_token_ids,
                     long_adapter=long_adapter, short_adapter=short_adapter,
                     alpha=args.lsat_alpha, topk=topk_tuple
                 )
                 tag = args.mode
+                print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(orig_metrics.items())]))
                 print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
                 with open(os.path.join(args.output_dir, f'test_metrics_{tag}.json'), 'w', encoding='utf-8') as f:
                     json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1773,8 +1784,10 @@ def main():
             # eval with LoRA
             eval_model = lora_model
 
+        orig_metrics = evaluate(eval_model, orig_loader, device, item_token_ids, topk=topk_tuple)
         metrics = evaluate(eval_model, test_loader, device, item_token_ids, topk=topk_tuple)
         tag = args.mode
+        print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(orig_metrics.items())]))
         print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
         with open(os.path.join(args.output_dir, f'test_metrics_{tag}.json'), 'w', encoding='utf-8') as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1833,6 +1846,8 @@ def main():
             )
             print(f"[MoLE][Epoch {ep}] loss={ft_loss:.4f}")
 
+        orig_metrics = evaluate(mole_model, orig_loader, device, item_token_ids, topk=topk_tuple)
+        print("[Test][MoLE]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(orig_metrics.items())]))
         metrics = evaluate(mole_model, test_loader, device, item_token_ids, topk=topk_tuple)
         print("[Test][MoLE]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
         with open(os.path.join(args.output_dir, 'test_metrics_mole.json'), 'w', encoding='utf-8') as f:
@@ -1949,13 +1964,20 @@ def main():
         soft_rep_factor=args.soft_rep_factor
     )
 
+    orig_stats = bank.route_and_eval(orig_ds, eval_collator, item_token_ids, _eval_fn_for_raie,
+                                k_list=topk_tuple)
     stats = bank.route_and_eval(test_ds, eval_collator, item_token_ids, _eval_fn_for_raie,
                                 k_list=topk_tuple)
     import pandas as pd
+    orig_df = pd.DataFrame(orig_stats)
     df = pd.DataFrame(stats)
     w = df["num_samples"]; W = max(1, w.sum())
+    orig_w = orig_df["num_samples"]
+    orig_W = max(1, orig_w.sum())
+    global_orig_metrics = {m: float((orig_df[m] * orig_w).sum() / orig_W) for m in orig_df.columns if m.startswith(("Recall@", "NDCG@"))}
     global_metrics = {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
-    print("[RAIE][Global]", global_metrics)
+    print("[RAIE][Global][original]", global_orig_metrics)
+    print("[RAIE][Global][Test]", global_metrics)
 
     with open(os.path.join(args.output_dir, "raie_test_global.json"), "w", encoding="utf-8") as f:
         json.dump(global_metrics, f, ensure_ascii=False, indent=2)
