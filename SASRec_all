@@ -1,1 +1,1246 @@
+# raie_sasrec_five_modes.py
+# -*- coding: utf-8 -*-
+import os, io, re, math, json, argparse, random
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
+
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
+from torch.nn.utils import clip_grad_norm_
+
+# ---- NEW: LoRA / PEFT ----
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except Exception as e:
+    PEFT_AVAILABLE = False
+    _PEFT_ERR = e
+
+# ------------------------------
+# Utilities
+# ------------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True); return p
+
+def read_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line=line.strip()
+            if line: rows.append(json.loads(line))
+    return rows
+
+_TOKEN_RE = re.compile(r"<item_(\d+)>")
+def tok_to_id(tok: str) -> int:
+    m = _TOKEN_RE.fullmatch(tok.strip())
+    if m: return int(m.group(1))
+    tok = tok.strip().lstrip("<").rstrip(">")
+    if tok.startswith("item_"): tok = tok[len("item_"):]
+    return int(tok)
+
+def subsequent_mask(size: int, device):
+    return torch.triu(torch.ones(size, size, device=device, dtype=torch.bool), diagonal=1)
+
+def load_item_ids_map(item_ids_path: str):
+    with open(item_ids_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+        vocab = obj["item_ids"] if isinstance(obj, dict) and "item_ids" in obj else obj
+    vocab = [int(x) for x in vocab]
+    id2idx = {mid: (i+1) for i, mid in enumerate(vocab)}  # 1..N, 0=PAD
+    return id2idx, len(vocab)
+
+# ------------------------------
+# Data building（和原SASRec一致，只是函数名与布局风格统一）
+# ------------------------------
+@dataclass
+class ExamplePrompt:
+    prompt_tokens: List[str]
+    target_token: str
+
+class StreamStride1Dataset(Dataset):
+    """从 original_stream.jsonl 生成 stride=1 的 (prompt, target) 对"""
+    def __init__(self, path_stream: str):
+        rows = read_jsonl(path_stream)
+        self.examples: List[ExamplePrompt] = []
+        for r in rows:
+            toks = (r.get("items") or "").strip().split()
+            if len(toks) < 2: continue
+            for t in range(1, len(toks)):
+                self.examples.append(ExamplePrompt(toks[:t], toks[t]))
+    def __len__(self): return len(self.examples)
+    def __getitem__(self, i): return self.examples[i]
+
+class NextItemDataset(Dataset):
+    """JSONL: {prompt, target}"""
+    def __init__(self, jsonl_path: str):
+        rows = read_jsonl(jsonl_path)
+        self.examples: List[ExamplePrompt] = []
+        for r in rows:
+            p = (r.get("prompt") or "").strip()
+            t = (r.get("target") or "").strip()
+            if not p or not t: continue
+            self.examples.append(ExamplePrompt(p.split(), t))
+    def __len__(self): return len(self.examples)
+    def __getitem__(self, i): return self.examples[i]
+
+def build_user_seq_from_stream(rows: List[dict]) -> Dict[int, List[Tuple[int,int]]]:
+    per: Dict[int, List[Tuple[int,int]]] = {}
+    for r in rows:
+        uid = int(r["user_id"])
+        item_toks = (r.get("items") or "").split()
+        ts_strs   = (r.get("timestamps") or "").split()
+        if not item_toks or not ts_strs: continue
+        L = min(len(item_toks), len(ts_strs))
+        if L < 2: continue
+        mids = [tok_to_id(t) for t in item_toks[:L]]
+        tss  = [int(s) for s in ts_strs[:L]]
+        per.setdefault(uid, []).extend(zip(mids, tss))
+    for u in per:
+        seq = sorted(per[u], key=lambda x: x[1])
+        dedup, seen = [], set()
+        for mid, ts in seq:
+            if (mid, ts) in seen: continue
+            seen.add((mid, ts)); dedup.append((mid, ts))
+        per[u] = dedup
+    return per
+
+def remap_user_pairs_by_vocab(item_ids_path: str,
+                              user_seq_pairs: Dict[int, List[Tuple[int,int]]]) -> Tuple[Dict[int, List[int]], int, Dict[int,int]]:
+    id2idx, n_items = load_item_ids_map(item_ids_path)
+    users_idx: Dict[int, List[int]] = {}
+    for u, pairs in user_seq_pairs.items():
+        idx_seq = []
+        for mid, _ts in pairs:
+            if mid in id2idx: idx_seq.append(id2idx[mid])
+        users_idx[u] = idx_seq
+    return users_idx, n_items, id2idx
+
+def load_train_sequences_from_stream(data_dir: str, min_user_len: int = 5):
+    path_stream = os.path.join(data_dir, "original_stream.jsonl")
+    path_vocab  = os.path.join(data_dir, "item_ids.json")
+    if not os.path.exists(path_stream): raise FileNotFoundError(path_stream)
+    if not os.path.exists(path_vocab):  raise FileNotFoundError(path_vocab)
+
+    rows_stream = read_jsonl(path_stream)
+    pairs = build_user_seq_from_stream(rows_stream)
+    users_idx, n_items, id2idx = remap_user_pairs_by_vocab(path_vocab, pairs)
+    train_seq = {u: s for u, s in users_idx.items() if len(s) >= min_user_len}
+    return train_seq, n_items, id2idx
+
+# ------------------------------
+# Datasets (SASRec)
+# ------------------------------
+class SASRecTrainDataset(Dataset):
+    def __init__(self, user2seq: Dict[int, List[int]], n_items: int, maxlen: int):
+        self.users = list(user2seq.keys())
+        self.u2s = user2seq
+        self.n_items = n_items
+        self.maxlen = maxlen
+        self.user_pos_set = {u: set(user2seq[u]) for u in self.users}
+    def __len__(self): return len(self.users)
+    def _sample_neg(self, user: int) -> int:
+        while True:
+            neg = random.randint(1, self.n_items)
+            if neg not in self.user_pos_set[user]: return neg
+    def __getitem__(self, idx):
+        u = self.users[idx]
+        seq = self.u2s[u][-self.maxlen-1:]
+        seq_arr = np.zeros([self.maxlen], dtype=np.int64)
+        pos_arr = np.zeros([self.maxlen], dtype=np.int64)
+        neg_arr = np.zeros([self.maxlen], dtype=np.int64)
+        L = len(seq)
+        idx_from = max(0, L-1-self.maxlen)
+        tokens = seq[idx_from:L-1]
+        targets= seq[idx_from+1:L]
+        seq_arr[-len(tokens):] = tokens
+        pos_arr[-len(targets):] = targets
+        for i in range(self.maxlen):
+            if pos_arr[i] != 0:
+                neg_arr[i] = self._sample_neg(u)
+        return (torch.tensor(seq_arr, dtype=torch.long),
+                torch.tensor(pos_arr, dtype=torch.long),
+                torch.tensor(neg_arr, dtype=torch.long))
+
+class SASRecFinetuneWindowDataset(Dataset):
+    """窗口式微调样本：prompt → (在最后位置预测 target)"""
+    def __init__(self, finetune_rows: List[dict], id2idx: Dict[int,int], n_items: int, maxlen: int):
+        self.samples = []
+        self.n_items = n_items; self.maxlen = maxlen
+        for r in finetune_rows:
+            if not r.get("prompt") or not r.get("target"): continue
+            ctx_tok = r["prompt"].split()
+            ctx_idx = [id2idx[tok_to_id(t)] for t in ctx_tok if tok_to_id(t) in id2idx]
+            if len(ctx_idx) == 0: continue
+            tgt_raw = tok_to_id(r["target"])
+            if tgt_raw not in id2idx: continue
+            tgt_idx = id2idx[tgt_raw]
+
+            seq_arr = np.zeros([maxlen], dtype=np.int64)
+            ctx = ctx_idx[-maxlen:]
+            seq_arr[-len(ctx):] = np.array(ctx, dtype=np.int64)
+
+            pos_arr = np.zeros([maxlen], dtype=np.int64)
+            neg_arr = np.zeros([maxlen], dtype=np.int64)
+            last_pos = max(0, len(ctx) - 1)
+            pos_arr[-len(ctx) + last_pos] = tgt_idx
+
+            ctx_set = set(ctx)
+            while True:
+                neg = random.randint(1, n_items)
+                if (neg not in ctx_set) and (neg != tgt_idx): break
+            neg_arr[-len(ctx) + last_pos] = neg
+
+            self.samples.append((torch.tensor(seq_arr, dtype=torch.long),
+                                 torch.tensor(pos_arr, dtype=torch.long),
+                                 torch.tensor(neg_arr, dtype=torch.long)))
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
+
+class EvalWindowDataset(Dataset):
+    """评测集：提供 (seq, tgt_idx, ctx_list)"""
+    def __init__(self, test_rows: List[dict], id2idx: Dict[int,int], maxlen: int):
+        self.samples = []
+        self.maxlen = maxlen
+        for r in test_rows:
+            if not r.get("prompt") or not r.get("target"):
+                continue
+            ctx_idx = [id2idx[tok_to_id(t)]
+                       for t in r["prompt"].split()
+                       if tok_to_id(t) in id2idx]
+            if len(ctx_idx) == 0: continue
+            tgt_raw = tok_to_id(r["target"])
+            if tgt_raw not in id2idx: continue
+            tgt_idx = id2idx[tgt_raw]
+            ctx = ctx_idx[-maxlen:]
+            seq = np.zeros([maxlen], dtype=np.int64)
+            seq[-len(ctx):] = np.array(ctx, dtype=np.int64)
+            self.samples.append((torch.tensor(seq, dtype=torch.long), int(tgt_idx), np.array(ctx, dtype=np.int64)))
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
+
+def train_collate(batch):
+    seqs  = torch.stack([b[0] for b in batch])
+    poss  = torch.stack([b[1] for b in batch])
+    negs  = torch.stack([b[2] for b in batch])
+    return {'seq': seqs, 'pos': poss, 'neg': negs}
+
+def eval_collate(batch):
+    seqs  = torch.stack([b[0] for b in batch])
+    tgts  = torch.tensor([b[1] for b in batch], dtype=torch.long)
+    ctxs  = [b[2] for b in batch]
+    return {'seq': seqs, 'tgt': tgts, 'ctx': ctxs}
+
+# ------------------------------
+# SASRec (与原实现一致，整理成模块)
+# ------------------------------
+class SASBlock(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_ff: int, dropout: float):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model; self.nhead = nhead; self.head_dim = d_model // nhead
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model, eps=1e-6)
+        self.linear1 = nn.Linear(d_model, dim_ff)
+        self.linear2 = nn.Linear(dim_ff, d_model)
+        self.act = nn.GELU()
+        self.resid_dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model, eps=1e-6)
+        nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+        nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight); nn.init.zeros_(self.out_proj.bias)
+        nn.init.xavier_uniform_(self.linear1.weight); nn.init.zeros_(self.linear1.bias)
+        nn.init.xavier_uniform_(self.linear2.weight); nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], key_padding_mask: Optional[torch.Tensor]):
+        B, L, D = x.shape
+        q = self.q_proj(x).view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        neg_large = torch.finfo(scores.dtype).min
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask.unsqueeze(0).unsqueeze(0), neg_large)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), neg_large)
+            scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(3), neg_large)
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        ctx = torch.matmul(attn, v)
+        ctx = ctx.transpose(1, 2).contiguous().view(B, L, D)
+        x = x + self.resid_dropout1(self.out_proj(ctx))
+        x = self.norm1(x)
+        y = self.linear2(self.act(self.linear1(x)))
+        x = x + self.resid_dropout2(y)
+        x = self.norm2(x)
+        return x
+
+class SASRec(nn.Module):
+    def __init__(self, n_items: int, maxlen: int, hidden_units: int=128,
+                 num_blocks: int=2, num_heads: int=2, dropout: float=0.2):
+        super().__init__()
+        self.n_items = n_items; self.maxlen = maxlen; self.hidden_units = hidden_units
+        self.item_emb = nn.Embedding(n_items+1, hidden_units, padding_idx=0)
+        self.pos_emb  = nn.Embedding(maxlen, hidden_units)
+        self.emb_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([SASBlock(hidden_units, num_heads, hidden_units*4, dropout)
+                                     for _ in range(num_blocks)])
+        self.layer_norm = nn.LayerNorm(hidden_units, eps=1e-6)
+        nn.init.normal_(self.item_emb.weight[1:], std=0.02)
+        with torch.no_grad(): self.item_emb.weight[0].zero_()
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
+
+    def forward(self, seq_ids: torch.Tensor = None, *, input_ids: torch.Tensor = None, **kwargs):
+        if (seq_ids is None) and (input_ids is None):
+            raise ValueError("SASRec.forward expects `seq_ids` or `input_ids`")
+        if (seq_ids is not None) and (input_ids is not None):
+            raise ValueError("Pass either `seq_ids` or `input_ids`, not both")
+        seq_ids = input_ids if input_ids is not None else seq_ids
+        B, L = seq_ids.shape
+        device = seq_ids.device
+        pos = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+        key_padding_mask = (seq_ids == 0)
+        x = self.item_emb(seq_ids) + self.pos_emb(pos)
+        x = self.emb_dropout(x)
+        x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+        attn_mask = subsequent_mask(L, device)
+        h = x
+        for blk in self.blocks:
+            h = blk(h, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        h = self.layer_norm(h)
+        return h
+
+    def score(self, h_t: torch.Tensor) -> torch.Tensor:
+        W = self.item_emb.weight[1:]            # [n_items, D]
+        logits = torch.matmul(h_t, W.t())       # [B, n_items]
+        return logits
+
+    def get_input_embeddings(self):
+        return self.item_emb
+
+# ------------------------------
+# Metrics & evaluation
+# ------------------------------
+def _recall_at_k(rank: int, k: int) -> float: return 1.0 if rank <= k else 0.0
+def _ndcg_at_k(rank: int, k: int) -> float:
+    if rank > k: return 0.0
+    return 1.0 / math.log2(rank + 1)
+
+@torch.no_grad()
+def evaluate_windows(model: SASRec, loader: DataLoader, n_items: int, topk_list: List[int],
+                     device, exclude_seen=True) -> Dict[str, float]:
+    model.eval()
+    K_list = sorted(topk_list)
+    sums = {f"Recall@{k}":0.0 for k in K_list}
+    sums.update({f"NDCG@{k}":0.0 for k in K_list})
+    n = 0
+    for batch in tqdm(loader, desc="Eval(win)", leave=False):
+        seq = batch['seq'].to(device); tgt_idx = batch['tgt'].to(device); ctx_list = batch['ctx']
+        h = model(seq)
+        lengths = (seq != 0).sum(dim=1).clamp(min=1); last_pos = (lengths - 1)
+        h_t = h[torch.arange(h.size(0), device=device), last_pos]
+        logits = model.score(h_t)  # [B, n_items]
+        scores = logits.clone()
+        if exclude_seen:
+            for i, ctx_np in enumerate(ctx_list):
+                seen = set(int(x) for x in ctx_np.tolist() if x > 0)
+                seen.discard(int(tgt_idx[i].item()))
+                if seen:
+                    seen0 = torch.tensor([s-1 for s in seen], device=scores.device, dtype=torch.long)
+                    scores[i].index_fill_(0, seen0, float('-inf'))
+        top_idx = torch.argsort(scores, dim=1, descending=True)
+        tgt0 = (tgt_idx - 1).unsqueeze(1)
+        pos = (top_idx == tgt0).nonzero(as_tuple=False)
+        B = seq.size(0)
+        for i in range(B):
+            where = pos[(pos[:,0] == i)]
+            r = int(where[0,1].item()) + 1 if where.numel() > 0 else (n_items + 1)
+            for k in K_list:
+                sums[f"Recall@{k}"] += _recall_at_k(r, k)
+                sums[f"NDCG@{k}"]   += _ndcg_at_k(r, k)
+            n += 1
+    return {k: (v / max(1, n)) for k, v in sums.items()}
+
+# ------------------------------
+# Training (O-stage) & Finetune (F-stage)
+# ------------------------------
+def train_one_epoch(model: SASRec, loader: DataLoader, device, optimizer, grad_clip: float = 1.0) -> Dict[str, float]:
+    model.train()
+    total = 0.0; steps = 0
+    for batch in tqdm(loader, desc="Train(O)", leave=False):
+        seq = batch['seq'].to(device); pos = batch['pos'].to(device); neg = batch['neg'].to(device)
+        h = model(seq)
+        pos_emb = model.item_emb(pos); neg_emb = model.item_emb(neg)
+        pos_logits = (h * pos_emb).sum(dim=-1)
+        neg_logits = (h * neg_emb).sum(dim=-1)
+        mask = (pos > 0).float()
+        loss_pos = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits), reduction='none')
+        loss_neg = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits), reduction='none')
+        loss = ((loss_pos + loss_neg) * mask).sum() / mask.sum().clamp_min(1.0)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0: clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        total += float(loss.detach().item()); steps += 1
+    return {"train_loss": total / max(1, steps)}
+
+class ReplayBuffer:
+    def __init__(self, base_dataset: Dataset, batch_size: int):
+        self.loader = DataLoader(base_dataset, batch_size=batch_size, shuffle=True,
+                                 num_workers=0, collate_fn=train_collate)
+        self.it = iter(self.loader)
+    def next_batch(self):
+        try: return next(self.it)
+        except StopIteration:
+            self.it = iter(self.loader); return next(self.it)
+
+@torch.no_grad()
+def _clone_params(model: nn.Module):
+    return {n: p.detach().clone() for n,p in model.named_parameters() if p.requires_grad}
+
+def ewc_loss(model: nn.Module, fisher: Dict[str, torch.Tensor], prev_params: Dict[str, torch.Tensor], lam: float):
+    reg = 0.0
+    for n,p in model.named_parameters():
+        if p.requires_grad and (n in fisher):
+            reg = reg + (fisher[n] * (p - prev_params[n])**2).sum()
+    return lam * reg
+
+@torch.no_grad()
+def _last_position_index(seq: torch.Tensor) -> torch.Tensor:
+    return (seq != 0).sum(dim=1).clamp(min=1) - 1
+
+def _candidate_logits_from_hidden(model: SASRec, h: torch.Tensor, pos_idx: torch.Tensor, neg_idx: torch.Tensor, last_pos: torch.Tensor):
+    B = h.size(0); device = h.device
+    h_t = h[torch.arange(B, device=device), last_pos]
+    pos_emb = model.item_emb(pos_idx[torch.arange(B, device=device), last_pos])
+    neg_emb = model.item_emb(neg_idx[torch.arange(B, device=device), last_pos])
+    cand_emb = torch.stack([pos_emb, neg_emb], dim=1)
+    logits = torch.einsum('bd,bkd->bk', h_t, cand_emb)
+    return logits
+
+def lwf_kd_loss(student: SASRec, teacher: SASRec,
+                seq: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor,
+                T: float = 2.0, alpha: float = 0.5):
+    last_pos = _last_position_index(seq)
+    with torch.no_grad():
+        h_teacher = teacher(seq)
+        t_logits = _candidate_logits_from_hidden(teacher, h_teacher, pos, neg, last_pos) / T
+        t_probs  = F.softmax(t_logits, dim=-1)
+    h_student = student(seq)
+    s_logits = _candidate_logits_from_hidden(student, h_student, pos, neg, last_pos) / T
+    s_log_probs = F.log_softmax(s_logits, dim=-1)
+    kd = F.kl_div(s_log_probs, t_probs, reduction='batchmean') * (T * T)
+    return alpha * kd
+
+def finetune_one_epoch_lora_sasrec(
+    model: SASRec,
+    finetune_loader: DataLoader,
+    device,
+    optimizer: torch.optim.Optimizer,
+    *,
+    plugin: str = 'none',
+    replay_buf: Optional[ReplayBuffer] = None,
+    teacher: Optional[nn.Module] = None,
+    lwf_T: float = 2.0,
+    lwf_alpha: float = 0.5,
+    replay_ratio: float = 0.3,
+    grad_clip: float = 1.0,
+    emb_anchor_ctx: Optional[dict] = None,
+    log_every: int = 100,
+) -> float:
+    model.train()
+    total_loss = 0.0; steps = 0
+    for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-LoRA", leave=False), start=1):
+        seq = batch['seq'].to(device); pos = batch['pos'].to(device); neg = batch['neg'].to(device)
+        h = model(seq)
+        pos_emb = model.item_emb(pos); neg_emb = model.item_emb(neg)
+        pos_logits = (h * pos_emb).sum(dim=-1)
+        neg_logits = (h * neg_emb).sum(dim=-1)
+        mask = (pos > 0).float()
+        loss_pos = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits), reduction='none')
+        loss_neg = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits), reduction='none')
+        base_loss = ((loss_pos + loss_neg) * mask).sum() / mask.sum().clamp_min(1.0)
+
+        loss = base_loss
+        replay_loss_val = torch.tensor(0.0, device=device)
+        kd_loss_val = torch.tensor(0.0, device=device)
+
+        if ('replay' in plugin) and (replay_buf is not None) and (replay_ratio > 0.0):
+            rb = replay_buf.next_batch()
+            rseq = rb['seq'].to(device); rpos = rb['pos'].to(device); rneg = rb['neg'].to(device)
+            hr = model(rseq)
+            rpos_emb = model.item_emb(rpos); rneg_emb = model.item_emb(rneg)
+            rpos_logits = (hr * rpos_emb).sum(dim=-1); rneg_logits = (hr * rneg_emb).sum(dim=-1)
+            rmask = (rpos > 0).float()
+            rloss_pos = F.binary_cross_entropy_with_logits(rpos_logits, torch.ones_like(rpos_logits), reduction='none')
+            rloss_neg = F.binary_cross_entropy_with_logits(rneg_logits, torch.zeros_like(rneg_logits), reduction='none')
+            replay_loss_val = ((rloss_pos + rloss_neg) * rmask).sum() / rmask.sum().clamp_min(1.0)
+            loss = (1.0 - replay_ratio) * loss + replay_ratio * replay_loss_val
+
+        if ('lwf' in plugin) and (teacher is not None):
+            kd_loss_val = lwf_kd_loss(model, teacher, seq, pos, neg, T=lwf_T, alpha=lwf_alpha)
+            loss = loss + kd_loss_val
+
+        if emb_anchor_ctx is not None and emb_anchor_ctx.get("enabled", False):
+            emb = model.item_emb
+            ids_t = emb_anchor_ctx["ids_tensor"]
+            E0 = emb_anchor_ctx["E0"]
+            lam = emb_anchor_ctx["lambda"]
+            if ids_t.numel() > 0:
+                loss = loss + lam * (emb.weight.index_select(0, ids_t) - E0.index_select(0, ids_t)).pow(2).mean()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0: clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        total_loss += float(loss.detach().item()); steps += 1
+        if (log_every is not None) and (log_every > 0) and (step % log_every == 0):
+            print(f"[F][step {step}] base:{base_loss.item():.4f} replay:{replay_loss_val.item():.4f} kd:{kd_loss_val.item():.4f} → total:{loss.item():.4f}")
+    return total_loss / max(1, steps)
+
+# =========================================================
+# ===== RAIE（保持你原SASRec-RAIE逻辑，风格化包装）=====
+# =========================================================
+def l2_normalize(X: np.ndarray, eps: float = 1e-12):
+    n = np.linalg.norm(X, axis=1, keepdims=True) + eps
+    return (X / n).astype(np.float32)
+
+def spherical_kmeans(X: np.ndarray, K: int, niter=30, seed=42):
+    try:
+        import faiss
+        km = faiss.Kmeans(d=X.shape[1], k=K, niter=niter, nredo=2,
+                          verbose=True, spherical=True, seed=seed)
+        km.train(X.astype(np.float32))
+        C = km.centroids.astype(np.float32)
+        index = faiss.IndexFlatIP(X.shape[1]); index.add(C)
+        _, lab = index.search(X, 1)
+        return C, lab.reshape(-1).astype(np.int32)
+    except Exception:
+        from sklearn.cluster import KMeans
+        skm = KMeans(n_clusters=K, n_init=10, max_iter=300, random_state=seed)
+        lab = skm.fit_predict(X)
+        C = l2_normalize(skm.cluster_centers_)
+        return C.astype(np.float32), lab.astype(np.int32)
+
+def per_cluster_radius(X, C, labels, q=0.9):
+    K = C.shape[0]; R = np.zeros(K, np.float32)
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        if len(idx) == 0: continue
+        dots = X[idx] @ C[k]
+        ang = np.arccos(np.clip(dots, -1, 1))
+        R[k] = np.quantile(ang, q).astype(np.float32)
+    return R
+
+def per_cluster_ang_std(X, C, labels):
+    K = C.shape[0]; sig = np.zeros(K, np.float32)
+    for k in range(K):
+        idx = np.where(labels == k)[0]
+        if len(idx) == 0: continue
+        dots = X[idx] @ C[k]
+        ang = np.arccos(np.clip(dots, -1, 1))
+        sig[k] = ang.std().astype(np.float32)
+    return sig
+
+@dataclass
+class PromptExample:
+    prompt_tokens: List[str]
+    target_token: str
+
+class PromptDatasetJSONL(Dataset):
+    def __init__(self, path: str):
+        rows = read_jsonl(path)
+        self.examples: List[PromptExample] = []
+        for r in rows:
+            p = (r.get("prompt") or "").strip(); t = (r.get("target") or "").strip()
+            if not p or not t: continue
+            self.examples.append(PromptExample(p.split(), t))
+    def __len__(self): return len(self.examples)
+    def __getitem__(self, i): return self.examples[i]
+
+class PromptDatasetFromStreamStride1(Dataset):
+    def __init__(self, path_stream: str):
+        rows = read_jsonl(path_stream)
+        self.examples: List[PromptExample] = []
+        for r in rows:
+            toks = (r.get("items") or "").strip().split()
+            if len(toks) < 2: continue
+            for t in range(1, len(toks)):
+                self.examples.append(PromptExample(toks[:t], toks[t]))
+    def __len__(self): return len(self.examples)
+    def __getitem__(self, i): return self.examples[i]
+
+@torch.no_grad()
+def encode_prompts_to_vecs_sasrec(model: SASRec, examples: List[PromptExample],
+                                  id2idx: Dict[int,int], maxlen: int, device,
+                                  use_mean_pool: bool = True, batch_size: int = 256, pbar: bool = False):
+    if hasattr(model, "set_adapter"):
+        try: model.set_adapter("default")
+        except Exception: pass
+    vecs = []
+    model.eval()
+    for i in tqdm(range(0, len(examples), batch_size), disable=not pbar, desc="Encode(prompt)"):
+        batch = examples[i:i+batch_size]
+        seq = np.zeros((len(batch), maxlen), dtype=np.int64)
+        for j, ex in enumerate(batch):
+            ids = []
+            for tok in ex.prompt_tokens:
+                mid = tok_to_id(tok)
+                if mid in id2idx: ids.append(id2idx[mid])
+            ids = ids[-maxlen:]
+            if len(ids) > 0:
+                seq[j, -len(ids):] = np.array(ids, dtype=np.int64)
+        seq = torch.tensor(seq, dtype=torch.long, device=device)
+        h = model(seq)  # [B,L,D]
+        mask = (seq != 0).float().unsqueeze(-1)  # [B,L,1]
+        if use_mean_pool:
+            s = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        else:
+            last = (seq != 0).sum(dim=1).clamp_min(1) - 1
+            rows = torch.arange(seq.size(0), device=device)
+            s = h[rows, last, :]
+        v = s.detach().float().cpu().numpy()
+        n = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+        vecs.append((v / n).astype(np.float32))
+    return np.concatenate(vecs, axis=0).astype(np.float32)
+
+def _clone_lora_adapter_weights(peft_model: nn.Module, src_name: str, dst_name: str):
+    for m in peft_model.modules():
+        hasA = hasattr(m, "lora_A"); hasB = hasattr(m, "lora_B")
+        if not (hasA and hasB): continue
+        try:
+            if (src_name in m.lora_A) and (dst_name in m.lora_A):
+                m.lora_A[dst_name].weight.data.copy_(m.lora_A[src_name].weight.data)
+            if (src_name in m.lora_B) and (dst_name in m.lora_B):
+                m.lora_B[dst_name].weight.data.copy_(m.lora_B[src_name].weight.data)
+            if hasattr(m, "lora_alpha"):
+                if isinstance(m.lora_alpha, dict): m.lora_alpha[dst_name] = m.lora_alpha[src_name]
+            if hasattr(m, "scaling"):
+                if isinstance(m.scaling, dict): m.scaling[dst_name] = m.scaling[src_name]
+        except Exception:
+            continue
+
+class RegionBankSASRec:
+    def __init__(self, model, id2idx: Dict[int,int], n_items: int, maxlen: int, device, out_dir: str,
+                 K=3, q=0.9, beta_post=8.0, delta_min=0.05, n0=5.0, kappa_ema=0.2,
+                 lora_r=8, lora_alpha=16, lora_dropout=0.05, lora_targets=('out_proj','linear1','linear2'),
+                 lam_new: float = -1.0):
+        self.model = model; self.id2idx = id2idx; self.n_items = n_items; self.maxlen = maxlen
+        self.device = device; self.out_dir = out_dir
+        self.K = K; self.q = q; self.beta_post = beta_post; self.delta_min = delta_min
+        self.n0 = n0; self.kappa_ema = kappa_ema; self.lam_new = lam_new
+        self.C = None; self.R = None; self.sig = None
+        self.S = None; self.n = None; self.kappa = None; self.pi = None; self.C0 = None
+        self.orig_idx_by_k: Dict[int, List[int]] = {}
+        self.lora_cfg = LoraConfig(
+            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            bias="none", task_type=TaskType.FEATURE_EXTRACTION, inference_mode=False,
+            target_modules=list(lora_targets),
+        )
+
+    def _init_vmf_from_labels(self, X: np.ndarray, labels: np.ndarray):
+        K, H = self.C.shape[0], X.shape[1]
+        self.S = np.zeros((K, H), np.float32); self.n = np.zeros((K,), np.float32)
+        for i, k in enumerate(labels.astype(int)):
+            self.S[k] += X[i]; self.n[k] += 1.0
+        self._recompute_mu_kappa_pi()
+
+    def _recompute_mu_kappa_pi(self):
+        eps = 1e-12
+        if self.C0 is None: self.C0 = self.C.copy()
+        S_hat = self.S + self.n0 * self.C0
+        n_hat = self.n + self.n0
+        normS = np.linalg.norm(S_hat, axis=1, keepdims=True) + eps
+        C_new = S_hat / normS
+        d = C_new.shape[1]
+        r = (normS.squeeze(-1)) / np.maximum(n_hat, 1e-6)
+        kappa_new = (r * (d - r ** 2)) / np.clip(1.0 - r ** 2, 1e-6, None)
+        kappa_new = np.clip(kappa_new, 1.0, 1e6).astype(np.float32)
+        if self.kappa is None:
+            self.kappa = kappa_new
+        else:
+            K_old = int(self.kappa.shape[0]); K_new = int(kappa_new.shape[0])
+            if K_old == K_new:
+                self.kappa = (1.0 - self.kappa_ema) * self.kappa + self.kappa_ema * kappa_new
+            elif K_old < K_new:
+                kappa = np.empty((K_new,), np.float32)
+                kappa[:K_old] = (1.0 - self.kappa_ema) * self.kappa + self.kappa_ema * kappa_new[:K_old]
+                kappa[K_old:] = kappa_new[K_old:]; self.kappa = kappa
+            else:
+                self.kappa = (1.0 - self.kappa_ema) * self.kappa[:K_new] + self.kappa_ema * kappa_new
+        nsum = float(np.maximum(n_hat.sum(), 1.0)); self.pi = (n_hat / nsum).astype(np.float32)
+        self.C = C_new.astype(np.float32)
+
+    def _scores_post(self, x: np.ndarray):
+        sims = self.C @ x
+        scores = np.log(np.clip(self.pi, 1e-8, None)) + self.kappa * sims
+        top2 = np.argsort(scores)[-2:]; k2, k1 = int(top2[0]), int(top2[1])
+        s1, s2 = float(scores[k1]), float(scores[k2])
+        z = scores - scores.max(); p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
+        return k1, k2, s1, s2, float(p[k1]), float(p[k2])
+
+    def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
+        return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
+
+    def _decide_action(self, x: np.ndarray):
+        k1, k2, s1, s2, p1, p2 = self._scores_post(x)
+        tau1 = self._tau_assign(k1)
+        if s1 < self.lam_new and p1 < tau1 * 0.7: return ("add", k1, k2, p1, p2)
+        if p1 >= tau1 and (p1 - p2) >= self.delta_min: return ("update", k1, k2, p1, p2)
+        if p1 >= tau1: return ("expand", k1, k2, p1, p2)
+        return ("add", k1, k2, p1, p2)
+
+    def _propose_new_centers(self, Xp: np.ndarray, max_new=2):
+        if Xp.shape[0] == 0: return []
+        cand = []
+        mu1 = Xp.mean(0); mu1 /= (np.linalg.norm(mu1) + 1e-12); cand.append(mu1.astype(np.float32))
+        if Xp.shape[0] >= 50 and max_new >= 2:
+            C2, _ = spherical_kmeans(Xp, 2, niter=20, seed=42)
+            cand.extend([C2[0], C2[1]])
+        return cand[:max_new]
+
+    def _sync_R_sig(self, new_centers=None, Xp=None, assign=None):
+        K = self.C.shape[0]
+        if self.R is None:  self.R = np.zeros((0,), np.float32)
+        if self.sig is None: self.sig = np.zeros((0,), np.float32)
+        if self.R.shape[0] < K:
+            add_n = K - self.R.shape[0]
+            mR = float(np.median(self.R)) if self.R.size else 0.30
+            ms = float(np.median(self.sig)) if self.sig.size else 0.10
+            addR = np.full((add_n,), mR, np.float32); addS = np.full((add_n,), ms, np.float32)
+            if (new_centers is not None) and (Xp is not None) and (assign is not None):
+                for t in range(min(add_n, len(new_centers))):
+                    idx = np.where(assign == t)[0]
+                    if idx.size:
+                        mu = new_centers[t]
+                        dots = Xp[idx] @ mu
+                        ang = np.arccos(np.clip(dots, -1, 1))
+                        addR[t] = np.quantile(ang, self.q).astype(np.float32)
+                        addS[t] = ang.std().astype(np.float32)
+            self.R = np.concatenate([self.R, addR]); self.sig = np.concatenate([self.sig, addS])
+        elif self.R.shape[0] > K:
+            self.R = self.R[:K]; self.sig = self.sig[:K]
+
+    def _maybe_merge_by_angle(self, angle_thr=np.deg2rad(12), max_pairs=1):
+        K = self.C.shape[0]
+        if K <= 1: return
+        pairs = []
+        for i in range(K):
+            for j in range(i+1, K):
+                ang = np.arccos(np.clip(self.C[i] @ self.C[j], -1, 1))
+                if ang < angle_thr: pairs.append((ang, i, j))
+        pairs.sort(); merged = 0
+        for _, i, j in pairs:
+            if i >= self.C.shape[0] or j >= self.C.shape[0]: continue
+            self.S[i] = self.S[i] + self.S[j]; self.n[i] = self.n[i] + self.n[j]
+            self.S = np.delete(self.S, j, axis=0); self.n = np.delete(self.n, j, axis=0)
+            self.C = np.delete(self.C, j, axis=0)
+            if self.C0 is not None: self.C0 = np.delete(self.C0, j, axis=0)
+            if self.R is not None:  self.R = np.delete(self.R,  j, axis=0)
+            if self.sig is not None: self.sig= np.delete(self.sig, j, axis=0)
+            if self.kappa is not None:self.kappa=np.delete(self.kappa,j, axis=0)
+            if self.pi is not None:   self.pi   =np.delete(self.pi,   j, axis=0)
+            merged += 1
+            if merged >= max_pairs: break
+        self._recompute_mu_kappa_pi(); self._sync_R_sig()
+
+    def _ensure_adapter(self, adapter_name: str):
+        if ("default" not in getattr(self.model, "peft_config", {})):
+            default_dir = os.path.join(self.out_dir, "default")
+            if os.path.isdir(default_dir):
+                self.model.load_adapter(default_dir, adapter_name="default", is_trainable=False)
+        existing = getattr(self.model, "peft_config", {})
+        if adapter_name not in existing:
+            self.model.add_adapter(adapter_name, self.lora_cfg)
+            if "default" in getattr(self.model, "peft_config", {}):
+                _clone_lora_adapter_weights(self.model, "default", adapter_name)
+
+    def fit_regions_on_original(self, original_prompts: Dataset, seed=42):
+        if hasattr(self.model, "set_adapter"):
+            self.model.set_adapter("default")
+        self.model.eval()
+        X = encode_prompts_to_vecs_sasrec(self.model, original_prompts.examples, self.id2idx,
+                                          self.maxlen, self.device, pbar=True)
+        C, labels = spherical_kmeans(X, self.K, niter=30, seed=seed)
+        R = per_cluster_radius(X, C, labels, q=self.q)
+        sig = per_cluster_ang_std(X, C, labels)
+        self.C, self.R, self.sig = C, R, sig
+        self.C0 = C.copy()
+        self._init_vmf_from_labels(X, labels)
+        self.orig_idx_by_k = {k: [] for k in range(self.K)}
+        for i, k in enumerate(labels): self.orig_idx_by_k[int(k)].append(i)
+        np.savez(os.path.join(self.out_dir, "raie_regions_init.npz"),
+                 centroids=C, radii=R, sig=sig, K=self.K, dim=C.shape[1])
+        return labels
+
+    def map_finetune(self, finetune_prompts: Dataset, pool_min=200, bic_gain=1e4):
+        if hasattr(self.model, "set_adapter"):
+            self.model.set_adapter("default")
+        self.model.eval()
+        Xn = encode_prompts_to_vecs_sasrec(self.model, finetune_prompts.examples, self.id2idx,
+                                           self.maxlen, self.device, pbar=True)
+        buckets: Dict[int, List[int]] = {k: [] for k in range(self.C.shape[0])}
+        add_pool, add_fallback, soft_pairs = [], [], []
+        for i in range(Xn.shape[0]):
+            x = Xn[i]
+            act, k1, k2, p1, p2 = self._decide_action(x)
+            if act == "update":
+                buckets[k1].append(i); self.S[k1] += x; self.n[k1] += 1.0
+            elif act == "expand":
+                buckets[k1].append(i); s = p1 + p2 + 1e-8; w1, w2 = p1/s, p2/s
+                soft_pairs.append((i, k1, k2, float(w1), float(w2)))
+                self.S[k1] += 0.25 * x; self.n[k1] += 0.25
+            else:
+                add_pool.append(i); add_fallback.append((i, k1)); soft_pairs.append((i, k1, k2, 0.3, 0.0))
+        self._recompute_mu_kappa_pi()
+
+        if len(add_pool) >= pool_min:
+            Xp = Xn[add_pool]
+            centers = self._propose_new_centers(Xp, max_new=2)
+
+            # BIC 接受检验（与原实现一致）
+            if len(centers)>0:
+                # 粗略BIC：比较加入新中心前后“近似最大似然”的差异并扣复杂度
+                sims_old = Xp @ self.C.T
+                scores_old = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims_old * self.kappa[None, :]
+                ll_old = float(np.max(scores_old, axis=1).sum())
+
+                def _est_kappa(mu):
+                    dots = Xp @ mu; rbar = float(np.mean(np.clip(dots, -1, 1))); d = Xp.shape[1]
+                    return max(1.0, min(1e6, (rbar * (d - rbar**2)) / max(1e-6, (1 - rbar**2))))
+
+                addC = np.stack(centers, 0).astype(np.float32)
+                kappa_new = np.array([_est_kappa(mu) for mu in addC], np.float32)
+                sims_new = Xp @ addC.T
+                score_new = sims_new * kappa_new[None, :]
+                w = np.maximum(score_new.mean(0), 1e-6); w = w / (w.sum() + 1e-8)
+                eps = 0.10
+                all_mu = np.vstack([self.C, addC])
+                all_kappa = np.concatenate([self.kappa, kappa_new])
+                all_pi = np.concatenate([self.pi * (1 - eps), w * eps]); all_pi = all_pi / (all_pi.sum() + 1e-8)
+                sims_all = Xp @ all_mu.T
+                scores_all = np.log(np.clip(all_pi, 1e-8, None))[None, :] + sims_all * all_kappa[None, :]
+                ll_new = float(np.max(scores_all, axis=1).sum())
+                d = Xp.shape[1]; K0 = self.C.shape[0]; K1 = K0 + len(centers)
+                bic_old = ll_old - 0.5 * (K0 * d) * np.log(Xp.shape[0] + 1e-8)
+                bic_new = ll_new - 0.5 * (K1 * d) * np.log(Xp.shape[0] + 1e-8)
+                accept = (bic_new - bic_old) > bic_gain
+            else:
+                accept = False
+
+            if accept:
+                K_old = self.C.shape[0]
+                for mu_new in centers:
+                    self.S = np.vstack([self.S, mu_new[None, :]])
+                    self.n = np.append(self.n, 1.0)
+                if self.C0 is None: self.C0 = self.C.copy()
+                self.C0 = np.vstack([self.C0, np.stack(centers, 0)])
+                self._recompute_mu_kappa_pi()
+                for k in range(K_old, self.C.shape[0]):
+                    if k not in buckets: buckets[k] = []
+                sims = Xp @ np.stack(centers, 0).T
+                assign = np.argmax(sims, axis=1)
+                self._sync_R_sig(new_centers=centers, Xp=Xp, assign=assign)
+                for j, i in enumerate(add_pool):
+                    buckets[K_old + int(assign[j])].append(i)
+            else:
+                for i, k1 in add_fallback:
+                    buckets[k1].append(i)
+        else:
+            for i, k1 in add_fallback:
+                buckets[k1].append(i)
+
+        self._maybe_merge_by_angle(angle_thr=np.deg2rad(12), max_pairs=0)
+        np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
+                 centroids=self.C, radii=self.R, sig=self.sig,
+                 kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
+        return buckets, soft_pairs
+
+    def train_regions(self,
+                      finetune_rows: List[dict],
+                      original_rows: List[dict],
+                      region_buckets: Dict[int, List[int]],
+                      soft_pairs: List[Tuple[int,int,int,float,float]],
+                      id2idx: Dict[int,int],
+                      epochs_per_region=2,
+                      batch_size=256,
+                      orig_mix_ratio=0.3,
+                      seed=42):
+        ft_ds = SASRecFinetuneWindowDataset(finetune_rows, id2idx, self.n_items, self.maxlen)
+        orig_ds_full = SASRecFinetuneWindowDataset(original_rows, id2idx, self.n_items, self.maxlen)
+
+        soft_idx_by_k: Dict[int, List[int]] = {k: [] for k in region_buckets.keys()}
+        for (i, k1, k2, w1, w2) in soft_pairs:
+            if w1 > 0: soft_idx_by_k[k1].extend([i] * max(0, int(round(w1 * 2))))
+            if w2 > 0: soft_idx_by_k[k2].extend([i] * max(0, int(round(w2 * 2))))
+
+        emb_hook_handle = None
+
+        for k, idx_list in sorted(region_buckets.items(), key=lambda kv: -len(kv[1])):
+            if len(idx_list) == 0: continue
+            name = f"region_{k}"
+            self._ensure_adapter(name)
+            self.model.set_adapter(name)
+            if hasattr(self.model, "train_adapter"):
+                self.model.train_adapter(name)
+            self.model.train()
+
+            ft_subset = Subset(ft_ds, idx_list)
+
+            if (k in self.orig_idx_by_k) and (orig_mix_ratio > 0) and (len(self.orig_idx_by_k[k]) > 0):
+                n_ft = len(ft_subset)
+                n_orig = int(round(n_ft * orig_mix_ratio / max(1e-8, 1.0 - orig_mix_ratio)))
+                rng = np.random.RandomState(seed)
+                sel = rng.choice(self.orig_idx_by_k[k], size=min(n_orig, len(self.orig_idx_by_k[k])), replace=False)
+                orig_subset = Subset(orig_ds_full, sel.tolist())
+                base_ds = ConcatDataset([ft_subset, orig_subset])
+            else:
+                base_ds = ft_subset
+
+            if len(soft_idx_by_k[k]) > 0:
+                soft_subset = Subset(ft_ds, soft_idx_by_k[k])
+                train_ds = ConcatDataset([base_ds, soft_subset])
+            else:
+                train_ds = base_ds
+
+            dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
+            optim = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=5e-4)
+
+            # 选择性微调涉及的 item embedding + anchor（保持与你原实现一致）
+            used = set()
+            for i in idx_list:
+                # 从 finetune_rows 取 target
+                # 这里 idx_list 对应 ft_ds 的索引，因此直接用 ft_ds.samples 读取更稳
+                try:
+                    _, pos_arr, _ = ft_ds[i]
+                    tgt_ids = [int(x) for x in pos_arr.tolist() if x > 0]
+                    for t in tgt_ids: used.add(t)
+                except Exception:
+                    pass
+
+            emb = self.model.item_emb
+            E0 = emb.weight.detach().clone()
+            emb_anchor_ctx = None
+            if len(used) > 0:
+                emb.weight.requires_grad_(True)
+                emb_row_mask = torch.zeros_like(emb.weight, dtype=torch.bool)
+                idx_used = torch.tensor(sorted(used), device=emb.weight.device)
+                emb_row_mask[idx_used] = True
+                def _grad_mask(g): return g.masked_fill(~emb_row_mask, 0)
+                if emb_hook_handle is not None:
+                    emb_hook_handle.remove(); emb_hook_handle = None
+                emb_hook_handle = emb.weight.register_hook(_grad_mask)
+                emb_anchor_ctx = {"enabled": True, "ids_tensor": idx_used, "E0": E0, "lambda": 1e-4}
+
+            for ep in range(epochs_per_region):
+                loss_ep = 0.0
+                for b in dl:
+                    seq, pos, neg = b['seq'].to(self.device), b['pos'].to(self.device), b['neg'].to(self.device)
+                    h = self.model(seq)
+                    pos_emb = self.model.item_emb(pos); neg_emb = self.model.item_emb(neg)
+                    pos_logits = (h * pos_emb).sum(dim=-1); neg_logits = (h * neg_emb).sum(dim=-1)
+                    loss_mask = (pos > 0).float()
+                    loss_pos = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits), reduction='none')
+                    loss_neg = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits), reduction='none')
+                    loss = ((loss_pos + loss_neg) * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+                    if emb_anchor_ctx is not None and emb_anchor_ctx.get("enabled", False):
+                        ids_t = emb_anchor_ctx["ids_tensor"]; E0 = emb_anchor_ctx["E0"]; lam = emb_anchor_ctx["lambda"]
+                        loss = loss + lam * (emb.weight.index_select(0, ids_t) - E0.index_select(0, ids_t)).pow(2).mean()
+                    optim.zero_grad(set_to_none=True); loss.backward(); optim.step()
+                    loss_ep += float(loss.detach().item())
+                print(f"[RAIE][Region {k}] ep {ep+1}/{epochs_per_region} loss={loss_ep/max(1,len(dl)):.4f}")
+
+            save_dir = os.path.join(self.out_dir, f"adapter_region_{k}")
+            os.makedirs(save_dir, exist_ok=True)
+            self.model.save_pretrained(save_dir, selected_adapters=[name])
+
+        if emb_hook_handle is not None:
+            emb_hook_handle.remove()
+
+    @torch.no_grad()
+    def route_and_eval(self, test_rows: List[dict], id2idx: Dict[int,int],
+                       topk=(5,10,20), batch_size=512):
+        if hasattr(self.model, "set_adapter"):
+            self.model.set_adapter("default")
+        self.model.eval()
+
+        keep_idx = []
+        for i, r in enumerate(test_rows):
+            if not r.get("prompt") or not r.get("target"): continue
+            mids = [tok_to_id(t) for t in r["prompt"].split()]
+            mids = [m for m in mids if m in id2idx]
+            if len(mids) == 0: continue
+            tgt = tok_to_id(r["target"])
+            if tgt not in id2idx: continue
+            keep_idx.append(i)
+
+        test_prompts = PromptDatasetJSONL.__new__(PromptDatasetJSONL)
+        test_prompts.examples = [PromptExample(test_rows[i]["prompt"].split(), test_rows[i]["target"]) for i in keep_idx]
+        X = encode_prompts_to_vecs_sasrec(self.model, test_prompts.examples, id2idx, self.maxlen, self.device, pbar=True)
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        route_k = np.argmax(scores, axis=1)
+
+        eval_ds_full = EvalWindowDataset(test_rows, id2idx, maxlen=self.maxlen)
+        idx_by_k: Dict[int, List[int]] = {k: [] for k in range(self.C.shape[0])}
+        for local_i, _g_idx in enumerate(keep_idx): idx_by_k[int(route_k[local_i])].append(local_i)
+
+        all_stats = []
+        for k, idxs in idx_by_k.items():
+            if len(idxs) == 0: continue
+            name = f"region_{k}"
+            adapter_dir = os.path.join(self.out_dir, f"adapter_region_{k}", name)
+            if os.path.isdir(adapter_dir) and (name not in getattr(self.model, "peft_config", {})):
+                self.model.load_adapter(adapter_dir, adapter_name=name, is_trainable=False)
+            self.model.set_adapter(name if name in getattr(self.model, "peft_config", {}) else "default")
+            sub = Subset(eval_ds_full, idxs)
+            dl = DataLoader(sub, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=eval_collate)
+            m = evaluate_windows(self.model, dl, self.n_items, list(topk), self.device, exclude_seen=True)
+            m["cluster_id"] = int(k); m["num_samples"] = len(sub)
+            all_stats.append(m)
+        return all_stats
+
+# =========================================================
+# Main（五种模式：base / lora / lora_replay / lora_lwf / raie）
+# =========================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='raie',
+                        choices=['base','lora','lora_replay','lora_lwf','raie'],
+                        help='五种方案：base / lora / lora_replay / lora_lwf / raie')
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/',
+                        help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
+    parser.add_argument('--output_dir', type=str, default='./runs/sasrec_yelp')
+
+    # Seq / vocab
+    parser.add_argument('--min_user_len', type=int, default=5)
+    parser.add_argument('--maxlen', type=int, default=50)
+
+    # Model
+    parser.add_argument('--hidden_units', type=int, default=128)
+    parser.add_argument('--num_blocks', type=int, default=2)
+    parser.add_argument('--num_heads', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.2)
+
+    # O-stage
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+
+    # F-stage
+    parser.add_argument('--finetune_epochs', type=int, default=3)
+    parser.add_argument('--finetune_batch_size', type=int, default=256)
+    parser.add_argument('--finetune_lr', type=float, default=5e-4)
+
+    # Plugins
+    parser.add_argument('--replay_ratio', type=float, default=0.3)
+    parser.add_argument('--lwf_T', type=float, default=2.0)
+    parser.add_argument('--lwf_alpha', type=float, default=0.5)
+
+    # LoRA
+    parser.add_argument('--lora_r', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.05)
+    parser.add_argument('--lora_target', type=str, default='q_proj,k_proj,v_proj,out_proj,linear1,linear2')
+
+    # RAIE
+    parser.add_argument('--K', type=int, default=3)
+    parser.add_argument('--q', type=float, default=0.9)
+    parser.add_argument('--beta_post', type=float, default=8.0)
+    parser.add_argument('--delta_min', type=float, default=0.05)
+    parser.add_argument('--orig_mix_ratio', type=float, default=0.7)
+    parser.add_argument('--lam_new', type=float, default=-1.0)
+
+    # Eval
+    parser.add_argument('--topk', type=str, default='5,10,20')
+    parser.add_argument('--seed', type=int, default=42)
+
+    args = parser.parse_args()
+    if args.mode in ('lora','lora_replay','lora_lwf','raie') and (not PEFT_AVAILABLE):
+        raise RuntimeError(f"peft not available: {_PEFT_ERR}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    set_seed(args.seed)
+    device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+
+    # ===== 数据 =====
+    train_seq, n_items, id2idx = load_train_sequences_from_stream(args.data_dir, min_user_len=args.min_user_len)
+    train_ds = SASRecTrainDataset(train_seq, n_items=n_items, maxlen=args.maxlen)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
+
+    test_path = os.path.join(args.data_dir, "test.jsonl")
+    if not os.path.exists(test_path): raise FileNotFoundError(test_path)
+    test_rows = read_jsonl(test_path)
+    eval_ds = EvalWindowDataset(test_rows, id2idx, maxlen=args.maxlen)
+    eval_loader = DataLoader(eval_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
+
+    # ===== 模型（O-stage）=====
+    base_model = SASRec(
+        n_items=n_items, maxlen=args.maxlen, hidden_units=args.hidden_units,
+        num_blocks=args.num_blocks, num_heads=args.num_heads, dropout=args.dropout
+    ).to(device)
+
+    optim = torch.optim.AdamW(base_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    for ep in range(1, args.epochs+1):
+        tr = train_one_epoch(base_model, train_loader, device, optim, grad_clip=args.grad_clip)
+        print(f"[O][Epoch {ep}] loss={tr['train_loss']:.4f}")
+
+    teacher = None
+    if args.mode == 'lora_lwf':
+        import copy
+        teacher = copy.deepcopy(base_model).to(device)
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.eval()
+
+    # 测试 base（统一风格）
+    topk_tuple = tuple(int(x) for x in args.topk.split(','))
+    if args.mode == 'base':
+        metrics = evaluate_windows(base_model, eval_loader, n_items, list(topk_tuple), device)
+        print("[Test][base]", ' '.join([f"{k}:{v:.6f}" for k,v in sorted(metrics.items())]))
+        with open(os.path.join(args.output_dir, "test_metrics_base.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        return
+
+    # ===== LoRA 包装（lora / lora_replay / lora_lwf / raie）=====
+    target_modules = [t.strip() for t in args.lora_target.split(',') if t.strip()]
+    lora_cfg = LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        bias='none', task_type=TaskType.FEATURE_EXTRACTION, target_modules=target_modules,
+    )
+    lora_model = get_peft_model(base_model, lora_cfg).to(device)
+    try: lora_model.print_trainable_parameters()
+    except: pass
+
+    # ===== F-stage：三种LoRA方案 =====
+    if args.mode in ('lora','lora_replay','lora_lwf'):
+        finetune_path = os.path.join(args.data_dir, "finetune.jsonl")
+        if (not os.path.exists(finetune_path)):
+            print("[Warn] finetune.jsonl missing; evaluate base directly.")
+            eval_model = lora_model
+        else:
+            rows_f = read_jsonl(finetune_path)
+            ft_ds = SASRecFinetuneWindowDataset(rows_f, id2idx, n_items=n_items, maxlen=args.maxlen)
+            ft_loader = DataLoader(ft_ds, batch_size=args.finetune_batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
+
+            # 选择性解冻 F 段目标 item embedding 行 + anchor
+            emb = lora_model.get_input_embeddings() if hasattr(lora_model, "get_input_embeddings") else lora_model.item_emb
+            E0 = emb.weight.detach().clone()
+            tune_ids = set()
+            for r in rows_f:
+                tgt_tok = (r.get("target") or "").strip()
+                if not tgt_tok: continue
+                mid = tok_to_id(tgt_tok)
+                if mid in id2idx: tune_ids.add(id2idx[mid])
+            emb_anchor_ctx = None; emb_hook = None
+            if len(tune_ids) > 0:
+                emb.weight.requires_grad_(True)
+                mask = torch.zeros_like(emb.weight, dtype=torch.bool)
+                ids_tensor = torch.tensor(sorted(tune_ids), device=emb.weight.device)
+                mask[ids_tensor] = True
+                def _grad_mask(g): return g.masked_fill(~mask, 0)
+                emb_hook = emb.weight.register_hook(_grad_mask)
+                emb_anchor_ctx = {"enabled": True, "ids_tensor": ids_tensor, "E0": E0, "lambda": 1e-4}
+
+            ft_params = [p for p in lora_model.parameters() if p.requires_grad]
+            ft_optim  = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
+
+            replay_buf = ReplayBuffer(train_ds, batch_size=args.finetune_batch_size) if (args.mode == 'lora_replay') else None
+            plugin_flag = 'none'
+            if args.mode == 'lora_replay': plugin_flag = 'replay'
+            if args.mode == 'lora_lwf':    plugin_flag = 'lwf'
+
+            for ep in range(1, args.finetune_epochs + 1):
+                ft_loss = finetune_one_epoch_lora_sasrec(
+                    lora_model, ft_loader, device, ft_optim,
+                    plugin=plugin_flag, replay_buf=replay_buf,
+                    teacher=teacher, lwf_T=args.lwf_T, lwf_alpha=args.lwf_alpha,
+                    replay_ratio=args.replay_ratio, grad_clip=args.grad_clip,
+                    emb_anchor_ctx=emb_anchor_ctx, log_every=100
+                )
+                print(f"[F][Epoch {ep}] LoRA finetune_loss = {ft_loss:.4f}")
+
+            if emb_hook is not None: emb_hook.remove()
+
+            # 保存 LoRA（default）
+            lora_dir = ensure_dir(os.path.join(args.output_dir, "default"))
+            lora_model.save_pretrained(lora_dir, selected_adapters=["default"])
+            print(f"[F] Saved LoRA adapter to {lora_dir}")
+            eval_model = lora_model
+
+        # 测试
+        metrics = evaluate_windows(eval_model, eval_loader, n_items, list(topk_tuple), device)
+        tag = args.mode
+        print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(metrics.items())]))
+        with open(os.path.join(args.output_dir, f"test_metrics_{tag}.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        return
+
+    # ===== 方案5：RAIE =====
+    assert args.mode == 'raie'
+    finetune_path = os.path.join(args.data_dir, "finetune.jsonl")
+    if (not os.path.exists(finetune_path)):
+        raise RuntimeError("[RAIE] finetune.jsonl is required.")
+    rows_f = read_jsonl(finetune_path)
+    test_rows = test_rows
+    # 原始 routing 用的样本：优先 original_stride1.jsonl；否则从 stream 生成
+    path_stride1 = os.path.join(args.data_dir, "original_stride1.jsonl")
+    if os.path.exists(path_stride1):
+        original_prompts = PromptDatasetJSONL(path_stride1)
+        original_rows_for_mix = read_jsonl(path_stride1)
+    else:
+        original_prompts = PromptDatasetFromStreamStride1(os.path.join(args.data_dir, "original_stream.jsonl"))
+        original_rows_for_mix = [{"prompt": " ".join(ex.prompt_tokens), "target": ex.target_token}
+                                 for ex in original_prompts.examples]
+
+    bank = RegionBankSASRec(
+        model=lora_model, id2idx=id2idx, n_items=n_items, maxlen=args.maxlen, device=device, out_dir=args.output_dir,
+        K=args.K, q=args.q, beta_post=args.beta_post, delta_min=args.delta_min,
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        lora_targets=target_modules, lam_new=args.lam_new
+    )
+    _ = bank.fit_regions_on_original(original_prompts)
+    region_buckets, soft_pairs = bank.map_finetune(PromptDatasetJSONL(finetune_path))
+    bank.train_regions(
+        finetune_rows=rows_f, original_rows=original_rows_for_mix,
+        region_buckets=region_buckets, soft_pairs=soft_pairs, id2idx=id2idx,
+        epochs_per_region=args.finetune_epochs, batch_size=args.finetune_batch_size,
+        orig_mix_ratio=args.orig_mix_ratio, seed=args.seed
+    )
+
+    stats = bank.route_and_eval(test_rows, id2idx, topk=topk_tuple, batch_size=512)
+    import pandas as pd
+    df = pd.DataFrame(stats)
+    if len(df) > 0:
+        w = df["num_samples"]; W = max(1, w.sum())
+        global_metrics = {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
+        print("[RAIE][Per-Region]"); print(df.to_string(index=False))
+        print("[RAIE][Global]", global_metrics)
+        with open(os.path.join(args.output_dir, "raie_test_global.json"), "w", encoding="utf-8") as f:
+            json.dump(global_metrics, f, ensure_ascii=False, indent=2)
+    else:
+        print("[RAIE] No routed samples; skip stats.")
+
+if __name__ == "__main__":
+    main()
 
