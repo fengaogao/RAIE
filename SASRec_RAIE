@@ -1,9 +1,8 @@
 # raie_sasrec_five_modes.py
 # -*- coding: utf-8 -*-
-import os, io, re, math, json, argparse, random
+import os, re, math, json, argparse, random
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
 
 import numpy as np
 from tqdm import tqdm
@@ -59,7 +58,7 @@ def load_item_ids_map(item_ids_path: str):
     return id2idx, len(vocab)
 
 # ------------------------------
-# Data building（和原SASRec一致，只是函数名与布局风格统一）
+# Data building (aligned with SASRec, standardized naming)
 # ------------------------------
 @dataclass
 class ExamplePrompt:
@@ -67,7 +66,7 @@ class ExamplePrompt:
     target_token: str
 
 class StreamStride1Dataset(Dataset):
-    """从 original_stream.jsonl 生成 stride=1 的 (prompt, target) 对"""
+    """Build stride-1 (prompt, target) pairs from original_stream.jsonl."""
     def __init__(self, path_stream: str):
         rows = read_jsonl(path_stream)
         self.examples: List[ExamplePrompt] = []
@@ -171,7 +170,7 @@ class SASRecTrainDataset(Dataset):
                 torch.tensor(neg_arr, dtype=torch.long))
 
 class SASRecFinetuneWindowDataset(Dataset):
-    """窗口式微调样本：prompt → (在最后位置预测 target)"""
+    """Windowed finetuning samples: prompt -> predict target at last position."""
     def __init__(self, finetune_rows: List[dict], id2idx: Dict[int,int], n_items: int, maxlen: int):
         self.samples = []
         self.n_items = n_items; self.maxlen = maxlen
@@ -206,7 +205,7 @@ class SASRecFinetuneWindowDataset(Dataset):
     def __getitem__(self, i): return self.samples[i]
 
 class EvalWindowDataset(Dataset):
-    """评测集：提供 (seq, tgt_idx, ctx_list)"""
+    """Evaluation samples: (seq, tgt_idx, ctx_list)."""
     def __init__(self, test_rows: List[dict], id2idx: Dict[int,int], maxlen: int):
         self.samples = []
         self.maxlen = maxlen
@@ -240,7 +239,7 @@ def eval_collate(batch):
     return {'seq': seqs, 'tgt': tgts, 'ctx': ctxs}
 
 # ------------------------------
-# SASRec (与原实现一致，整理成模块)
+# SASRec (same behavior, organized into modules)
 # ------------------------------
 class SASBlock(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_ff: int, dropout: float):
@@ -661,7 +660,7 @@ def finetune_one_epoch_mole(
     return total_loss / max(1, steps)
 
 # =========================================================
-# ===== RAIE（保持你原SASRec-RAIE逻辑，风格化包装）=====
+# ===== RAIE (SASRec-RAIE logic, organized) =====
 # =========================================================
 def l2_normalize(X: np.ndarray, eps: float = 1e-12):
     n = np.linalg.norm(X, axis=1, keepdims=True) + eps
@@ -960,9 +959,9 @@ class RegionBankSASRec:
             Xp = Xn[add_pool]
             centers = self._propose_new_centers(Xp, max_new=2)
 
-            # BIC 接受检验（与原实现一致）
+            # BIC acceptance test (same as original implementation)
             if len(centers)>0:
-                # 粗略BIC：比较加入新中心前后“近似最大似然”的差异并扣复杂度
+                # Rough BIC: compare approximate log-likelihood with complexity penalty.
                 sims_old = Xp @ self.C.T
                 scores_old = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims_old * self.kappa[None, :]
                 ll_old = float(np.max(scores_old, axis=1).sum())
@@ -1068,11 +1067,10 @@ class RegionBankSASRec:
             dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
             optim = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=5e-4)
 
-            # 选择性微调涉及的 item embedding + anchor（保持与你原实现一致）
+            # Selective finetuning for item embeddings + anchor (same as original implementation)
             used = set()
             for i in idx_list:
-                # 从 finetune_rows 取 target
-                # 这里 idx_list 对应 ft_ds 的索引，因此直接用 ft_ds.samples 读取更稳
+                # Read targets from ft_ds since idx_list indexes ft_ds samples.
                 try:
                     _, pos_arr, _ = ft_ds[i]
                     tgt_ids = [int(x) for x in pos_arr.tolist() if x > 0]
@@ -1163,15 +1161,15 @@ class RegionBankSASRec:
         return all_stats
 
 # =========================================================
-# Main（五种模式：base / lora / lora_replay / lora_lwf / raie）
+# Main (modes: base / lora / lora_replay / lora_lwf / lsat / raie / mole)
 # =========================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='raie',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
-                        help='七种方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
+                        help='Modes: base / lora / lora_replay / lora_lwf / lsat / raie / mole')
     parser.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_toys/',
-                        help='包含 original_stream.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
+                        help='Directory with original_stream.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
     parser.add_argument('--output_dir', type=str, default='./runs/sasrec_Amazon_toys')
 
     # Seq / vocab
@@ -1238,7 +1236,7 @@ def main():
     set_seed(args.seed)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    # ===== 数据 =====
+    # ===== Data =====
     train_seq, n_items, id2idx = load_train_sequences_from_stream(args.data_dir, min_user_len=args.min_user_len)
     train_ds = SASRecTrainDataset(train_seq, n_items=n_items, maxlen=args.maxlen)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
@@ -1255,7 +1253,7 @@ def main():
     original_ds = EvalWindowDataset(original_rows, id2idx, maxlen=args.maxlen)
     original_loader = DataLoader(original_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
 
-    # ===== 模型（O-stage）=====
+    # ===== Model (O-stage) =====
     base_model = SASRec(
         n_items=n_items, maxlen=args.maxlen, hidden_units=args.hidden_units,
         num_blocks=args.num_blocks, num_heads=args.num_heads, dropout=args.dropout
@@ -1275,7 +1273,7 @@ def main():
             p.requires_grad = False
         teacher.eval()
 
-    # 测试 base（统一风格）
+    # Evaluate base (consistent format)
     topk_tuple = tuple(int(x) for x in args.topk.split(','))
     if args.mode == 'base':
         original_metrics = evaluate_windows(base_model, original_loader, n_items, list(topk_tuple), device)
@@ -1286,7 +1284,7 @@ def main():
             json.dump(metrics, f, ensure_ascii=False, indent=2)
         return
 
-    # ===== LoRA 包装（lora / lora_replay / lora_lwf / lsat / raie / mole）=====
+    # ===== LoRA wrapper (lora / lora_replay / lora_lwf / lsat / raie / mole) =====
     target_modules = [t.strip() for t in args.lora_target.split(',') if t.strip()]
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -1296,7 +1294,7 @@ def main():
     try: lora_model.print_trainable_parameters()
     except: pass
 
-    # ===== F-stage：三种LoRA方案 & LSAT =====
+    # ===== F-stage: LoRA variants & LSAT =====
     if args.mode in ('lora','lora_replay','lora_lwf','lsat'):
         finetune_path = os.path.join(args.data_dir, "finetune.jsonl")
         if (not os.path.exists(finetune_path)):
@@ -1391,7 +1389,7 @@ def main():
                 lora_model.save_pretrained(short_dir, selected_adapters=[short_adapter])
                 return
 
-            # 选择性解冻 F 段目标 item embedding 行 + anchor
+            # Selective unfreeze for target item embedding rows + anchor
             emb = lora_model.get_input_embeddings() if hasattr(lora_model, "get_input_embeddings") else lora_model.item_emb
             E0 = emb.weight.detach().clone()
             tune_ids = set()
@@ -1430,13 +1428,13 @@ def main():
 
             if emb_hook is not None: emb_hook.remove()
 
-            # 保存 LoRA（default）
+            # Save LoRA (default)
             lora_dir = ensure_dir(os.path.join(args.output_dir, "default"))
             lora_model.save_pretrained(lora_dir, selected_adapters=["default"])
             print(f"[F] Saved LoRA adapter to {lora_dir}")
             eval_model = lora_model
 
-        # 测试
+        # Evaluate
         original_metrics = evaluate_windows(eval_model, original_loader, n_items, list(topk_tuple), device)
         tag = args.mode
         print(f"[original][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
@@ -1507,21 +1505,20 @@ def main():
         }, os.path.join(mole_dir, 'mole_gate.pt'))
         return
 
-    # ===== 方案5：RAIE =====
+    # ===== RAIE =====
     assert args.mode == 'raie'
     finetune_path = os.path.join(args.data_dir, "finetune.jsonl")
     if (not os.path.exists(finetune_path)):
         raise RuntimeError("[RAIE] finetune.jsonl is required.")
     rows_f = read_jsonl(finetune_path)
-    test_rows = test_rows
-    # 原始 routing 用的样本：优先 original_stride1.jsonl；否则从 stream 生成
+    # Routing samples: prefer original_stride1.jsonl; otherwise build from stream.
     path_stride1 = os.path.join(args.data_dir, "original_stride1.jsonl")
     if os.path.exists(path_stride1):
         original_prompts = PromptDatasetJSONL(path_stride1)
         original_rows_for_mix = read_jsonl(path_stride1)
     else:
         original_prompts = PromptDatasetFromStreamStride1(os.path.join(args.data_dir, "original_stream.jsonl"))
-        original_rows_for_mix = [{"prompt": "".join(ex.prompt_tokens), "target": ex.target_token}
+        original_rows_for_mix = [{"prompt": " ".join(ex.prompt_tokens), "target": ex.target_token}
                                  for ex in original_prompts.examples]
 
     bank = RegionBankSASRec(
