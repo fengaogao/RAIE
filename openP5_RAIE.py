@@ -1,11 +1,16 @@
 import sys
-import os, gc, math, json, random, argparse, re, shutil
-from dataclasses import dataclass
+import os
+import gc
+import math
+import json
+import random
+import argparse
+import re
 from typing import List, Dict, Tuple, Optional
 from datetime import timedelta
 from collections import defaultdict
 
-# ---------- 关键环境项：避免 tokenizers fork 死锁 & CUDA 内存碎片 ----------
+# ---------- Environment flags: avoid tokenizers fork deadlock and CUDA fragmentation ----------
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -40,7 +45,6 @@ try:
 except Exception:
     SKLEARN_AVAILABLE = False
 
-DATASET_NAME = "ML10M100K"
 _TOKEN_RE = re.compile(r"<item_(\d+)>")
 
 # ------------------------------
@@ -95,33 +99,19 @@ def set_seed(seed: int = 42, rank: int = 0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def amp_enabled_for_model(model: nn.Module, fp16_flag: bool) -> bool:
-    if not (fp16_flag and torch.cuda.is_available()):
-        return False
-    try:
-        dtypes = {p.dtype for p in model.parameters() if p.requires_grad}
-        if not dtypes:
-            return False
-        if torch.float16 in dtypes:
-            return False
-        return any(dt in (torch.float32, torch.bfloat16) for dt in dtypes)
-    except Exception:
-        pass
-        return False
-
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
 
 def aggressive_gc():
-    """更强的清理，尽量释放显存碎片。"""
+    """Perform aggressive garbage collection to reduce GPU fragmentation."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
 def _free_cuda(*objs):
-    """递归释放（包括可能的 .module），然后清理缓存。"""
+    """Recursively release objects (including .module) and clear caches."""
     for o in objs:
         try:
             if o is None:
@@ -137,7 +127,7 @@ def _free_cuda(*objs):
     aggressive_gc()
 
 # ==============================
-# 读取 original/test/finetune JSONL + item_ids.json
+# Load original/test/finetune JSONL + item_ids.json
 # ==============================
 def _tok_to_mid(tok: str) -> int:
     tok = tok.strip()
@@ -204,14 +194,14 @@ def _read_vocab(item_ids_path: str) -> List[int]:
         item_ids = obj
     return [int(x) for x in item_ids]
 
-# ---------- 新增：协同式 item_indexing ----------
+# ---------- Collaborative item indexing ----------
 def _build_base_map_collaborative(item_ids: List[int],
                                   train_pairs: Dict[int, List[Tuple[int, int]]]
                                   ) -> Dict[int, int]:
     """
-    协同式索引：按“训练集中物品出现次数（热度）”降序排序；
-    同热度用“首次出现时间（越早越前）”，再用“原始 item_id”打破平局。
-    仅改变 mid -> 连续 [0..N-1] 的映射顺序，不引入额外 token，兼容后续全部逻辑。
+    Collaborative indexing: sort by descending training frequency, then by earliest
+    first-seen time, then by original item_id for tie-breaking. This only changes
+    the mid -> [0..N-1] mapping order and keeps the rest of the logic intact.
     """
     pop: Dict[int, int] = defaultdict(int)
     first_ts: Dict[int, int] = {}
@@ -220,7 +210,7 @@ def _build_base_map_collaborative(item_ids: List[int],
             pop[m] += 1
             if m not in first_ts:
                 first_ts[m] = ts
-    # 缺失（只在 test 中出现）的物品，热度=0、时间=+inf
+    # Items missing from training (only in test) use zero popularity and max timestamp.
     big_ts = 1 << 62
     def sort_key(m):
         return (-pop.get(m, 0), first_ts.get(m, big_ts), m)
@@ -240,7 +230,7 @@ def _build_base_map(item_ids: List[int],
     if method == "collaborative":
         return _build_base_map_collaborative(item_ids, train_pairs)
 
-    # sequential：按训练集中首次出现时间
+    # Sequential: sort by first appearance time in training.
     first_ts: Dict[int, int] = {}
     for pairs in train_pairs.values():
         for m, ts in pairs:
@@ -314,13 +304,6 @@ def make_item_final_tokens(n_items: int) -> List[str]:
 # ------------------------------
 # Dataset / Collate
 # ------------------------------
-@dataclass
-class Example:
-    input_ids: List[int]
-    attention_mask: List[int]
-    labels: List[int]
-    target_item_idx: int
-
 def collate_batch(batch, pad_id: int):
     max_len = max(len(x["input_ids"]) for x in batch)
     def pad(seq, val):
@@ -515,7 +498,7 @@ def ce_loss_on_items(model, batch, device, item_final_token_ids: List[int], fp16
     return loss, scores
 
 # ------------------------------
-# Training (O 段)
+# Training (O stage)
 # ------------------------------
 def train_one_epoch(model, dataloader, optimizer, scheduler, device,
                     item_final_token_ids: List[int],
@@ -563,7 +546,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
     return total / max(1, len(dataloader))
 
 # ------------------------------
-# LoRA F 段插件：Replay
+# LoRA F-stage plugin: Replay
 # ------------------------------
 class ReplayBuffer:
     def __init__(self, dataset: Dataset, collate_fn, batch_size: int, sampler=None):
@@ -794,7 +777,7 @@ def finetune_one_epoch_mole(
             if (loss is None) or (not torch.isfinite(loss)):
                 print(f"[DBG-Y][NON-FINITE LOSS] step={step} loss={loss}")
 
-            # 额外：如果 forward 的 mix_logits 已经非有限，也跳过
+            # Extra safety: log if mix_logits becomes non-finite.
             if not torch.isfinite(out.logits).all():
                 print(f"[DBG-Y][NON-FINITE MIX_LOGITS] step={step}")
 
@@ -898,8 +881,8 @@ def finetune_one_epoch_causal_anchor(
     embed_model=None
 ):
     """
-    DDP 安全的 anchor 微调：前向/反传在 model（可为 DDP wrapper）；
-    嵌入正则/Hook 在 embed_model（unwrap 后模块）上做。
+    DDP-safe anchor finetuning: forward/backward uses the (possibly DDP-wrapped)
+    model, while embedding regularization/hooks use the unwrapped embed_model.
     """
     model.train()
     use_amp = fp16 and torch.cuda.is_available()
@@ -953,7 +936,7 @@ def save_clean_base_with_new_tokens(peft_wrapped, tokenizer, out_dir, orig_base_
     tokenizer.save_pretrained(out_dir)
 
 # =========================================================
-# ================ RAIE: RegionBank（此处开始有改动） ======
+# ================ RAIE: RegionBank (modified here) =======
 # =========================================================
 class RegionBank:
     def __init__(self, model, tok: AutoTokenizer, item_final_token_ids: List[int],
@@ -989,7 +972,7 @@ class RegionBank:
             target_modules=list(target_modules)
         )
 
-    # ---------- 工具：统计形状同步（支持动态增删 K） ----------
+    # ---------- Utility: sync stats shape (supports dynamic K) ----------
     def _sync_priors_shape(self):
         K, H = self.S.shape
         if self.C0 is None:
@@ -1010,7 +993,7 @@ class RegionBank:
         elif self.C0.shape[0] > K:
             self.C0 = self.C0[:K, :]
 
-    # ---------- 由充分统计重估 μ, κ, π ----------
+    # ---------- Recompute μ, κ, π from sufficient statistics ----------
     def _recompute_mu_kappa_pi(self):
         eps = 1e-12
         self._sync_priors_shape()
@@ -1042,7 +1025,7 @@ class RegionBank:
         self.pi = pi_new
         self.C = C_new
 
-    # ---------- 打分/动作 ----------
+    # ---------- Scoring / actions ----------
     def _scores_post(self, x: np.ndarray):
         sims = self.C @ x  # [K]
         scores = np.log(np.clip(self.pi, 1e-8, None)) + self.kappa * sims
@@ -1067,7 +1050,7 @@ class RegionBank:
             return ("expand", k1, k2, p1, p2)
         return ("add", k1, k2, p1, p2)
 
-    # ---------- 初始化（原域拟合） ----------
+    # ---------- Initialization (fit on original domain) ----------
     def fit_regions_on_original(self, seed=42):
         if self.original_ds is None or len(self.original_ds) == 0:
             raise RuntimeError("[RAIE] original dataset is required.")
@@ -1095,12 +1078,12 @@ class RegionBank:
         return labels
 
     # =====================================================
-    # ### [RAIE-CHANGE] 动态 K：BIC 评估 + 新簇提议 + 合并
+    # ### [RAIE-CHANGE] Dynamic K: BIC eval + new cluster proposal + merge
     # =====================================================
     def _bic_score_vmf(self, X: np.ndarray, mu: np.ndarray):
         """
-        近似 vMF BIC：用角距离的方差替代，BIC ~ N*log(sigma^2) + p*log(N)
-        只用于相对比较（split/merge 增益），常数项忽略。
+        Approximate vMF BIC using angular variance:
+        BIC ~ N * log(sigma^2) + p * log(N). Used only for relative comparison.
         """
         if X.shape[0] == 0:
             return 0.0
@@ -1113,11 +1096,11 @@ class RegionBank:
 
     def _bic_gain_for_split(self, X: np.ndarray, mu_parent: np.ndarray, seed=42):
         """
-        对 X 做二分 KMeans（球面），返回：gain, (mu_a, mu_b), (idx_a, idx_b)
+        Run spherical KMeans with K=2 on X and return: gain, (mu_a, mu_b), (idx_a, idx_b).
         """
         if X.shape[0] < 4:
             return -np.inf, None, None
-        # 二分
+        # Split into two clusters.
         C2, lab2 = spherical_kmeans(X, K=2, niter=30, seed=seed)
         idx_a = np.where(lab2 == 0)[0]; idx_b = np.where(lab2 == 1)[0]
         if len(idx_a) == 0 or len(idx_b) == 0:
@@ -1134,19 +1117,18 @@ class RegionBank:
 
     def _propose_new_cluster_from_pool(self, X_all: np.ndarray, add_pool: List[Tuple[int,int]], bic_gain=1e4, seed=42):
         """
-        从 add_pool（元素为 (idx_in_Xn, nearest_k1)）中尝试生成新簇。
-        过程：
-          1) 取池中样本的向量，按其最近簇做 parent 分组。
-          2) 对每个 parent 簇的池样本，计算 split 的 BIC 增益；若增益 >= bic_gain，则新建簇。
-          3) 更新全局 C/R/sig/S/n/kappa/pi（动态扩容）。
-        返回：是否新增了至少一个簇；并清理已消费的 add_pool 元素。
+        Attempt to generate new clusters from add_pool entries (idx_in_Xn, nearest_k1):
+          1) Group pooled samples by nearest parent cluster.
+          2) For each group, compute BIC split gain; if gain >= bic_gain, create a new cluster.
+          3) Update global C/R/sig/S/n/kappa/pi with dynamic expansion.
+        Returns whether at least one cluster was added and cleans consumed add_pool entries.
         """
         if len(add_pool) == 0:
             return False
 
         used = set()
         changed = False
-        # 逐 parent 簇聚合
+        # Group by parent cluster.
         by_parent: Dict[int, List[int]] = defaultdict(list)
         for idx, k1 in add_pool:
             by_parent[int(k1)].append(int(idx))
@@ -1160,20 +1142,20 @@ class RegionBank:
             if not np.isfinite(gain):
                 continue
             if gain < bic_gain:
-                continue  # 不足以成立新簇
+                continue  # Not enough evidence to create a new cluster.
 
-            # 选择较“偏离”的子簇为新簇（用与 parent 的角距离较大者）
+            # Choose the more deviated child cluster (larger angular distance to parent).
             (mu_a, mu_b) = mubu
             (idx_a, idx_b) = split_idx
             dot_a = float(np.clip(mu_a @ mu_parent, -1, 1))
             dot_b = float(np.clip(mu_b @ mu_parent, -1, 1))
-            # 角度大 -> dot 小
+            # Larger angle means smaller dot product.
             choose_b = (dot_b < dot_a)
             new_mu = mu_b if choose_b else mu_a
             new_idx_local = idx_b if choose_b else idx_a
             new_idx_global = [idx_list[i] for i in new_idx_local]
 
-            # --- 动态扩容 ---
+            # --- Dynamic expansion ---
             K_old, H = self.C.shape
             K_new = K_old + 1
 
@@ -1181,7 +1163,7 @@ class RegionBank:
             self.R = np.concatenate([self.R, np.array([0.0], np.float32)], axis=0)
             self.sig = np.concatenate([self.sig, np.array([0.0], np.float32)], axis=0)
 
-            # 充分统计（新簇 S,n 初值）
+            # Sufficient statistics for new cluster (S, n).
             vec_sum = X_all[new_idx_global].sum(0)
             S_new = vec_sum.astype(np.float32)
             n_new = float(len(new_idx_global))
@@ -1195,26 +1177,26 @@ class RegionBank:
             else:
                 self.C0 = np.vstack([self.C0, new_mu.reshape(1, -1).astype(np.float32)])
 
-            # 原始索引记录
+            # Track original indices.
             self.orig_idx_by_k[int(K_old)] = []
 
-            # 更新半径与方差（只针对新簇）
+            # Update radius and variance (new cluster only).
             dots = np.clip(X_all[new_idx_global] @ self.C[-1], -1, 1)
             ang = np.arccos(dots)
             self.R[-1] = np.quantile(ang, self.q).astype(np.float32)
             self.sig[-1] = ang.std().astype(np.float32)
 
-            # 重估 μ/κ/π
+            # Recompute μ/κ/π.
             self._recompute_mu_kappa_pi()
             self.K = int(self.C.shape[0])
 
-            # 这些样本在 add_pool 中已被消费
+            # These samples are consumed from add_pool.
             for gi in new_idx_global:
                 used.add((gi, parent_k))
 
             changed = True
 
-        # 清理 add_pool（未消费的保留用于“并回最近簇”）
+        # Clean add_pool (retain unconsumed entries for nearest-cluster fallback).
         if changed:
             add_pool[:] = [(i, k1) for (i, k1) in add_pool if (i, k1) not in used]
 
@@ -1222,13 +1204,13 @@ class RegionBank:
 
     def _try_merge_close_clusters(self, angle_thr: float = 0.15):
         """
-        尝试按“中心角距离 + BIC 增益”合并两个最近的簇。
-        返回：是否发生了合并。
+        Try to merge the closest pair using angular distance and BIC gain.
+        Returns whether a merge occurred.
         """
         if self.C.shape[0] <= 1:
             return False
         K = self.C.shape[0]
-        # 找到最近对
+        # Find the closest pair.
         sims = self.C @ self.C.T
         np.fill_diagonal(sims, -1.0)
         k_flat = np.argmax(sims)
@@ -1238,23 +1220,19 @@ class RegionBank:
         cos_ij = float(np.clip(self.C[i] @ self.C[j], -1, 1))
         ang_ij = math.acos(cos_ij)
         if ang_ij > angle_thr:
-            return False  # 不够近
+            return False  # Not close enough.
 
-        # 估计合并是否更优（BIC）
-        # 构造两个簇各自的“样本合成统计”（用 S,n 近似）
-        # 注意：我们没有逐样本，此处做启发式（与 BERT4Rec 版思路一致：有时只用统计量判断）
-        # 用均向量近似 X 集合来比较 BIC：合并后 r 提升则可能更优
-        # 为稳定：取虚拟样本矩阵时用向量方向叠加——这里直接比较“单簇 BIC 近似”差异
+        # Estimate whether merging improves BIC using S,n heuristics.
         mu_i = self.C[i]; mu_j = self.C[j]
         ni = max(float(self.n[i]), 1.0); nj = max(float(self.n[j]), 1.0)
-        # 近似 BIC（只作相对比较）
+        # Approximate BIC (relative comparison only).
         bic_i = ni * np.log(max(self.sig[i]**2, 1e-12))
         bic_j = nj * np.log(max(self.sig[j]**2, 1e-12))
 
         S_merge = self.S[i] + self.S[j]
         n_merge = ni + nj
         mu_merge = l2n(S_merge.reshape(1, -1)).reshape(-1)
-        # 合并后的近似方差：简单按权平均
+        # Approximate post-merge variance via weighted average.
         sig_merge = max( (ni*self.sig[i] + nj*self.sig[j]) / max(n_merge,1.0), 1e-6)
         bic_merge = n_merge * np.log(max(sig_merge**2, 1e-12))
 
@@ -1262,15 +1240,15 @@ class RegionBank:
         if gain < 0:
             return False
 
-        # 真正合并（收缩 i/j -> i）
+        # Merge by collapsing j into i.
         self.S[i] = S_merge.astype(np.float32)
         self.n[i] = n_merge
         self.C[i] = mu_merge.astype(np.float32)
         self.sig[i] = float(sig_merge)
-        # radius 重新估：用 sig 的分位近似（稳定起见，仍保留旧半径的较大者）
+        # Re-estimate radius with a stable heuristic (keep the larger radius).
         self.R[i] = float(max(self.R[i], self.R[j]))
 
-        # 删 j
+        # Drop j.
         keep = [k for k in range(self.C.shape[0]) if k != j]
         self.C = self.C[keep]
         self.R = self.R[keep]
@@ -1279,7 +1257,7 @@ class RegionBank:
         self.n = self.n[keep]
         if self.C0 is not None:
             self.C0 = self.C0[keep]
-        # 重映射 orig_idx_by_k
+        # Remap orig_idx_by_k.
         new_map = {}
         t = 0
         for k in range(len(keep)):
@@ -1290,7 +1268,7 @@ class RegionBank:
         self.K = int(self.C.shape[0])
         return True
 
-    # ---------- Map-&-Finetune ----------
+    # ---------- Map & Finetune ----------
     def map_finetune(self, finetune_ds: Dataset, pool_min=200, bic_gain=1e4):
         Xn = encode_prompts_to_vecs_causallm(self.model, finetune_ds, self.device, self.tok, batch_size=256)
         buckets = defaultdict(list)
@@ -1313,23 +1291,23 @@ class RegionBank:
                 add_pool.append((i, k1))
                 soft_pairs.append((i, k1, k2, 0.3, 0.0))
 
-            # 在线轻度更新（与 BERT4Rec 版一致）
+            # Light online updates (same idea as the BERT4Rec variant).
             if (i+1) % 64 == 0:
                 self._recompute_mu_kappa_pi()
 
-        # 先重估一次
+        # Recompute once before pool handling.
         self._recompute_mu_kappa_pi()
 
-        # ### [RAIE-CHANGE]：当池够大时，尝试新簇提议 + 可选合并
+        # ### [RAIE-CHANGE]: propose new clusters and optional merge when pool is large enough.
         if len(add_pool) >= pool_min:
             changed = self._propose_new_cluster_from_pool(Xn, add_pool, bic_gain=bic_gain, seed=42)
             if changed:
-                # 可选：做一次最邻近合并（与 BERT4Rec 版的“择优合并”一致）
+                # Optional: perform a nearest-cluster merge (same idea as BERT4Rec variant).
                 _ = self._try_merge_close_clusters(angle_thr=max(self.gap_thr, 0.05))
-                # 变更后，再重估一次统计
+                # Recompute statistics after changes.
                 self._recompute_mu_kappa_pi()
 
-        # 对剩余池样本（未触发新簇的）并回最近簇
+        # Assign remaining pooled samples to their nearest cluster.
         for idx, near_k1 in add_pool:
             buckets[near_k1].append(idx)
 
@@ -1338,7 +1316,7 @@ class RegionBank:
                  kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
         return buckets, soft_pairs
 
-    # ---------- 适配器准备 ----------
+    # ---------- Adapter setup ----------
     def _ensure_adapter(self, adapter_name: str):
         if adapter_name not in getattr(self.model, "peft_config", {}):
             dir_anchor = os.path.join(self.out_dir, "default_for_raie")
@@ -1350,7 +1328,7 @@ class RegionBank:
             else:
                 self.model.add_adapter(adapter_name, self.lora_cfg)
 
-    # ---------- 区域训练（覆盖新建 region） ----------
+    # ---------- Region training (including new regions) ----------
     def train_regions(self, finetune_ds: Dataset, collate_fn,
                       optimizer_ctor, scheduler_ctor,
                       epochs_per_region=2, batch_size=256, orig_mix_ratio=1.0, seed=42,
@@ -1454,7 +1432,7 @@ class RegionBank:
         return {k: (v / max(1, N)) for k, v in sums.items()}
 
 # ------------------------------
-# 公共工具：数据与 mid2idx 的保存/读取
+# Shared utilities: save/load data and mid2idx
 # ------------------------------
 def save_mid2idx(path: str, mid2idx: Dict[int, int]):
     try:
@@ -1476,8 +1454,8 @@ def load_mid2idx(path: str) -> Optional[Dict[int, int]]:
 
 def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
     """
-    优先从 output_dir/mid2idx.json 读取；否则重建（与原逻辑一致）。
-    返回 mid2idx 与 n_items。
+    Load mid2idx from output_dir/mid2idx.json when available, otherwise rebuild
+    using the same logic. Returns mid2idx and n_items.
     """
     mid2idx_path = os.path.join(args.output_dir, "mid2idx.json")
     mid2idx = load_mid2idx(mid2idx_path)
@@ -1488,7 +1466,7 @@ def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
             print(f"[INFO] Loaded mid2idx from {mid2idx_path} (|mid|={len(mid2idx)})")
         return mid2idx, n_items
 
-    # fallback：重建
+    # Fallback: rebuild mapping.
     if is_main:
         print("[INFO] mid2idx.json not found -> rebuild mapping from training split.")
     _, _, _, n_items2, mid2idx = load_preprocessed_splits(
@@ -1500,17 +1478,17 @@ def build_or_load_mid2idx(args, is_main=True) -> Tuple[Dict[int,int], int]:
         item_ids_path=args.item_ids_path or os.path.join(args.data_dir, "item_ids.json"),
         test_jsonl_path=None
     )
-    # 保存一下，供后续阶段直接复用
+    # Save for reuse in later stages.
     if (mid2idx is not None) and (len(mid2idx) > 0):
         if is_main:
             save_mid2idx(mid2idx_path, mid2idx)
             print(f"[SAVE] mid2idx saved to {mid2idx_path}")
-    assert n_items == n_items2, "item_ids 长度与重建得到的不一致，请检查数据一致性。"
+    assert n_items == n_items2, "item_ids size mismatch after rebuild; check data consistency."
     return mid2idx, n_items
 
 def make_datasets_for_stage(args, tok, mid2idx, n_items):
     """
-    用于各方法阶段的通用数据集构造（不依赖 pre 阶段的模型状态）。
+    Build datasets for each stage without relying on pre-stage model state.
     """
     final_item_tokens = make_item_final_tokens(n_items)
     item_token_seq = [[t] for t in final_item_tokens]
@@ -1537,15 +1515,15 @@ def make_datasets_for_stage(args, tok, mid2idx, n_items):
     return ds_trainO, ds_O, ds_T, ds_F, final_item_tokens
 
 # ------------------------------
-# 阶段执行函数
+# Stage execution functions
 # ------------------------------
 def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     """
-    跑完 LoRA 之前全部内容，输出：
-    - output_dir/default            （O 段 LoRA 适配器）
-    - output_dir/base_with_new_tokens（干净 Base + 新增 tokens）
+    Run everything before LoRA, producing:
+    - output_dir/default (O-stage LoRA adapter)
+    - output_dir/base_with_new_tokens (clean base with new tokens)
     - output_dir/mid2idx.json
-    - 原/测评指标 json
+    - original/test metrics json
     """
     # 1) Data / Indexing
     train_seq, val_seq, test_seq, n_items, mid2idx = load_preprocessed_splits(
@@ -1560,7 +1538,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     if is_main:
         print(f"[Data] items={n_items} | train_users={len(train_seq)} | val_users={len(val_seq)}")
 
-    # 2) Tokenizer & model（扩 vocab）
+    # 2) Tokenizer & model (extend vocab)
     if is_main:
         print("[Model] Loading tokenizer and model ...")
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
@@ -1596,7 +1574,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     item_final_token_ids: List[int] = [tok.convert_tokens_to_ids(t) for t in final_item_tokens]
 
-    # LoRA 包装（训练 O 段）
+    # LoRA wrapping (train O stage)
     if args.use_lora:
         if not PEFT_AVAILABLE:
             raise RuntimeError(f"PEFT not available: {_PEFT_ERR}")
@@ -1647,7 +1625,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
     ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
 
-    # 优化器（O 段）
+    # Optimizer (O stage)
     lora_params, emb_params, other_params = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -1668,7 +1646,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
 
     k_list = sorted(set(args.topk))
 
-    # 5) 训练（只训练 O 段，不在每 epoch 评估）
+    # 5) Training (O stage only, no per-epoch eval)
     if is_main:
         print(f"[Train] O-stage epochs={args.epochs}")
     for ep in range(1, args.epochs + 1):
@@ -1696,7 +1674,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     if is_distributed:
         dist.barrier()
 
-    # 保存 default 适配器 + 生成干净 base（带新 vocab） + mid2idx.json
+    # Save default adapter + clean base (with new vocab) + mid2idx.json
     if is_main and args.use_lora:
         default_dir = os.path.join(args.output_dir, "default")
         ensure_dir(default_dir)
@@ -1704,7 +1682,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         peft_wrapped.save_pretrained(default_dir, selected_adapters=["default"])
         tok.save_pretrained(default_dir)
 
-    # 生成干净 base
+    # Generate clean base.
     if is_main and args.use_lora:
         base_dir = os.path.join(args.output_dir, "base_with_new_tokens")
         save_clean_base_with_new_tokens(
@@ -1714,7 +1692,7 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
             orig_base_path=args.model_name_or_path
         )
         print(f"[SAVE] clean base saved to {base_dir}")
-        # 保存 mid2idx
+        # Save mid2idx.
         save_mid2idx(os.path.join(args.output_dir, "mid2idx.json"), mid2idx)
     if is_distributed:
         dist.barrier()
@@ -1759,7 +1737,7 @@ def stage_lora(args, device, is_distributed, local_rank, is_main, load_dtype):
     lora_model.load_adapter(default_dir, adapter_name="default", is_trainable=True)
     lora_model.set_adapter("default")
 
-    # 准备数据（基于保存/重建的 mid2idx）
+    # Prepare data (using saved/rebuilt mid2idx).
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_lora, mid2idx, n_items)
     pad_id = tok_lora.pad_token_id
@@ -2225,7 +2203,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     )
     raie_model.load_adapter(default_dir, adapter_name="default", is_trainable=True); raie_model.set_adapter("default")
 
-    # Anchor 微调（DDP 包裹，但正则用 unwrap 模块）
+    # Anchor finetuning (DDP wrapped, regularization on unwrapped module).
     if is_distributed:
         raie_model = torch.nn.parallel.DistributedDataParallel(
             raie_model, device_ids=[local_rank] if torch.cuda.is_available() else None,
@@ -2233,7 +2211,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
     rm = raie_model.module if hasattr(raie_model, "module") else raie_model
 
-    # 数据
+    # Data
     mid2idx, n_items = build_or_load_mid2idx(args, is_main=is_main)
     ds_trainO, ds_O, ds_T, ds_F, final_item_tokens = make_datasets_for_stage(args, tok_raie, mid2idx, n_items)
     pad_id = tok_raie.pad_token_id
@@ -2280,13 +2258,13 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
         if is_main: print(f"[RAIE][F-anchor] epoch={ep+1} loss={loss:.4f}")
 
-    # 保存 default（供区域适配器初始化/fallback）
+    # Save default adapter (for region adapter init/fallback).
     if is_main:
         default_dir2 = os.path.join(args.output_dir, "default_for_raie")
         ensure_dir(default_dir2)
         rm.save_pretrained(default_dir2, selected_adapters=["default"])
 
-    # 拟合区域 + region 分片训练（仅 rm 非 DDP，用 rm）
+    # Fit regions + per-region training (only on rank0, not DDP).
     bank = RegionBank(
         model=rm, tok=tok_raie,
         item_final_token_ids=item_final_token_ids,
@@ -2303,7 +2281,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         bank.S = bank.n = None
         bank.orig_idx_by_k = {}
         region_buckets = None; soft_pairs = None
-    # ==== 在这里加 barrier，确保所有 rank 同步后再去创建/使用 gloo 组 ====
+    # ==== Barrier here to sync all ranks before creating/using the gloo group ====
     if is_distributed:
         dist.barrier()
 
@@ -2318,7 +2296,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     region_buckets = bcast_object(region_buckets, src=0)
     soft_pairs = bcast_object(soft_pairs, src=0)
 
-    # —— 区域训练仅在 rank0 上进行，避免跨 rank 同步 ——
+    # -- Region training runs only on rank0 to avoid cross-rank synchronization --
     if is_main:
         bank.train_regions(
             finetune_ds=ds_F, collate_fn=collate,
@@ -2329,13 +2307,13 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
             epochs_per_region=args.raie_epochs_per_region,
             batch_size=args.finetune_batch_size,
             orig_mix_ratio=args.orig_mix_ratio,
-            region_buckets=region_buckets,  # 注意：这里用完整 buckets（含新建 region）
+            region_buckets=region_buckets,  # Use full buckets (including new regions).
             soft_pairs=soft_pairs,
             soft_rep_factor=args.soft_rep_factor, fp16=args.fp16
         )
 
     if is_distributed:
-        dist.barrier()  # 等 rank0 训练并落盘所有 region 适配器
+        dist.barrier()  # Wait for rank0 to finish training and saving region adapters.
 
     if is_main:
         k_list = sorted(set(args.topk))
@@ -2351,7 +2329,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     if is_distributed: dist.barrier()
 
 # ------------------------------
-# 主流程（新增 --stage 分流）
+# Main entry (with --stage routing)
 # ------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -2365,19 +2343,19 @@ def main():
     ap.add_argument('--item_ids_path', type=str, default='')
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
-    # 新增：阶段控制
+    # Stage control options.
     ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='raie',
-                    help='选择运行阶段')
+                    help="Select the stage to run")
     ap.add_argument('--resume_base_dir', type=str, default='',
-                    help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
+                    help="Path to saved base_with_new_tokens; defaults to output_dir/base_with_new_tokens")
     ap.add_argument('--skip_pre_if_exists', action='store_true', default=True,
-                    help='当 stage=all 且已存在 base_with_new_tokens 时，跳过 pre（默认开启）')
+                    help="When stage=all and base_with_new_tokens exists, skip pre (default on)")
 
     ap.add_argument('--item_indexing', type=str, choices=['sequential', 'random', 'collaborative'], default='sequential')
     ap.add_argument('--min_user_len', type=int, default=5)
     ap.add_argument('--max_history', type=int, default=10)
 
-    # 训练
+    # Training
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--lr', type=float, default=2e-4)
@@ -2395,10 +2373,10 @@ def main():
     ap.add_argument('--lora_dropout', type=float, default=0.05)
     ap.add_argument('--grad_checkpointing', action='store_true')
 
-    # 评测
+    # Evaluation
     ap.add_argument('--topk', type=int, nargs='+', default=[5, 10, 20])
 
-    # F 段方法公共
+    # Shared for F-stage methods
     ap.add_argument('--finetune_batch_size', type=int, default=32)
     ap.add_argument('--finetune_epochs', type=int, default=3)
 
@@ -2438,7 +2416,7 @@ def main():
     is_main = (rank == 0)
     set_seed(args.seed, rank)
 
-    # dtype 统一控制（大幅降低重载内存）
+    # Dtype control (reduce reload memory).
     load_dtype = torch.float16
 
     if torch.cuda.is_available():
@@ -2450,7 +2428,7 @@ def main():
     if is_main:
         ensure_dir(args.output_dir)
 
-    # 分阶段执行
+    # Stage execution
     if args.stage in ("all", "pre"):
         need_pre = True
         if args.stage == "all" and args.skip_pre_if_exists:
