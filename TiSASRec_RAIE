@@ -596,7 +596,8 @@ class MoLEMixture(nn.Module):
             emb_layer = self._get_input_emb()
             emb = emb_layer(seq_ids)
             mask = (seq_ids != self.pad_id).unsqueeze(-1).float()
-            pooled = (emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+            mask_sum = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+            pooled = (emb * mask).sum(dim=1) / mask_sum  # [B, D]
             gate_logits = self.gate(pooled) / self.temperature
             gate_weights = F.softmax(gate_logits, dim=-1)
 
@@ -1390,10 +1391,10 @@ def main():
                     choices=['base', 'lora', 'lora_replay', 'lora_lwf', 'lsat', 'raie', 'mole'],
                     help='方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
 
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/')
-    ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_Amazon_electronics')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/')
+    ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_yelp')
 
-    ap.add_argument('--max_len', type=int, default=50)
+    ap.add_argument('--max_len', type=int, default=20)
     ap.add_argument('--hidden_size', type=int, default=256)
     ap.add_argument('--layers', type=int, default=2)
     ap.add_argument('--heads', type=int, default=4)
@@ -1444,7 +1445,7 @@ def main():
     ap.add_argument('--lsat_short_epochs', type=int, default=3, help='Epochs for short-term adapter tuning')
 
     # ---- MoLE args ----
-    ap.add_argument('--mole_num_experts', type=int, default=4, help='Number of LoRA experts for MoLE')
+    ap.add_argument('--mole_num_experts', type=int, default=3, help='Number of LoRA experts for MoLE')
     ap.add_argument('--mole_gating_hidden', type=int, default=128, help='Hidden size of MoLE gating MLP')
     ap.add_argument('--mole_temp', type=float, default=0.7, help='Temperature for MoLE gating softmax')
     ap.add_argument('--mole_balance', type=float, default=0.01, help='KL regularization weight for balanced routing')
@@ -1455,7 +1456,7 @@ def main():
     ap.add_argument('--raie_q', type=float, default=0.9)
     ap.add_argument('--raie_pool_min', type=int, default=120)
     ap.add_argument('--raie_epochs_per_region', type=int, default=2)
-    ap.add_argument('--raie_orig_mix_ratio', type=float, default=0.3)
+    ap.add_argument('--raie_orig_mix_ratio', type=float, default=0.7)
     ap.add_argument('--raie_soft_rep_factor', type=int, default=2)
     ap.add_argument('--raie_beta_post', type=float, default=8.0)
     ap.add_argument('--raie_delta_min', type=float, default=0.05)
@@ -1513,6 +1514,7 @@ def main():
     train_path = os.path.join(args.data_dir, 'original_stream.jsonl')
     original_path = os.path.join(args.data_dir, 'original_stride1.jsonl')
     finetune_path = os.path.join(args.data_dir, 'finetune.jsonl')
+    original_test_path = os.path.join(args.data_dir, 'original.jsonl')
     test_path = os.path.join(args.data_dir, 'test.jsonl')
     if not (os.path.exists(train_path) and os.path.exists(test_path)):
         raise FileNotFoundError('Missing original_stream.jsonl or test.jsonl in data_dir')
@@ -1520,6 +1522,7 @@ def main():
     train_ds = StreamPairDataset(train_path, stride=args.train_stride, min_ctx=args.min_ctx)
     original_ds = SeqDataset(original_path) if os.path.exists(original_path) else None
     finetune_ds = SeqDataset(finetune_path) if os.path.exists(finetune_path) else None
+    original_test_ds = SeqDataset(original_test_path)
     test_ds = SeqDataset(test_path)
 
     clamp_days = None if args.time_clamp is None or args.time_clamp < 0 else args.time_clamp
@@ -1527,6 +1530,7 @@ def main():
     collate = Collator(token2id, args.max_len, pad_id, bucketizer, item_token_ids)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, collate_fn=collate)
+    original_test_loader = DataLoader(original_test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=collate)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=collate)
 
     # Model
@@ -1651,7 +1655,12 @@ def main():
                 E0=E0, ids_t=ids_t, lambda_anchor=lambda_anchor,
             )
             print(f"[LSAT][Short][Epoch {ep}] loss={ft_loss:.4f}")
-
+        original_metrics = evaluate_lsat_tisas(
+            lora_model, original_test_loader, device, pad_id, item_token_ids,
+            long_adapter=long_adapter, short_adapter=short_adapter,
+            alpha=args.lsat_alpha, topk=topk_tuple,
+        )
+        print("[original][lsat]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(original_metrics.items())]))
         metrics = evaluate_lsat_tisas(
             lora_model, test_loader, device, pad_id, item_token_ids,
             long_adapter=long_adapter, short_adapter=short_adapter,
@@ -1721,7 +1730,8 @@ def main():
                 grad_clip=args.grad_clip, log_every=100,
             )
             print(f"[MoLE][Epoch {ep}] loss={ft_loss:.4f}")
-
+        original_metrics = evaluate_mole_tisas(mole_model, original_test_loader, device, pad_id, item_token_ids, topk=topk_tuple)
+        print("[original][mole]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(original_metrics.items())]))
         metrics = evaluate_mole_tisas(mole_model, test_loader, device, pad_id, item_token_ids, topk=topk_tuple)
         print("[Test][mole]", ' '.join([f"{k}:{v:.4f}" for k, v in sorted(metrics.items())]))
         with open(os.path.join(args.output_dir, 'test_metrics_mole.json'), 'w', encoding='utf-8') as f:
@@ -1874,21 +1884,18 @@ def main():
             return evaluate(m, loader, device, pad_id, item_token_ids, list(topk_tuple))
 
         topk_tuple = tuple(int(x) for x in args.topk.split(','))
+        original_stats = bank.route_and_eval(original_test_ds, collate, pad_id, item_token_ids,
+                                    _eval_fn, k_list=topk_tuple, batch_size=args.finetune_batch_size)
         stats = bank.route_and_eval(test_ds, collate, pad_id, item_token_ids,
                                     _eval_fn, k_list=topk_tuple, batch_size=args.finetune_batch_size)
         import pandas as pd
-        df = pd.DataFrame(stats)
-        if len(df) > 0:
-            w = df["num_samples"].clip(lower=0)
-            W = max(1, float(w.sum()))
-            global_metrics = {m: float((df[m] * w).sum() / W) for m in df.columns if m.startswith(("Recall@", "NDCG@"))}
-            print("[RAIE][Global]", global_metrics)
-            try:
-                with open(os.path.join(args.output_dir, "raie_test_global.json"), "w", encoding="utf-8") as f:
-                    json.dump(global_metrics, f, ensure_ascii=False, indent=2)
-                df.to_json(os.path.join(args.output_dir, "raie_test_by_cluster.json"), orient="records", force_ascii=False, indent=2)
-            except Exception:
-                pass
+
+        original_df = pd.DataFrame(original_stats)
+        if len(original_df) > 0:
+            original_w = original_df["num_samples"].clip(lower=0)
+            original_W = max(1, float(original_w.sum()))
+            original_global_metrics = {m: float((original_df[m] * original_w).sum() / original_W) for m in original_df.columns if m.startswith(("Recall@", "NDCG@"))}
+            print("[RAIE][Global]", original_global_metrics)
     else:
         if args.mode != 'base':
             print("[RAIE] Skipped (mode != raie).")
