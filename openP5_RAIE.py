@@ -1951,7 +1951,7 @@ def stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype):
         print("[Done] LoRA+LwF:", mO, mT)
 
     try:
-        del FT_optim, FT_sched, teacher
+        del FT_optim, FT_sched
     except Exception:
         pass
     _free_cuda(lwf_model)
@@ -2356,8 +2356,8 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model_name_or_path', type=str, default='/home/zj/model/Llama-2-7b-hf')
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_electronics/')
-    ap.add_argument('--output_dir', type=str, default='./runs/openP5_Amazon_electronics')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/Amazon_toys/')
+    ap.add_argument('--output_dir', type=str, default='./runs/openP5_Amazon_toys')
 
     ap.add_argument('--train_jsonl_path', type=str, default='')
     ap.add_argument('--original_jsonl_path', type=str, default='')
@@ -2366,7 +2366,7 @@ def main():
     ap.add_argument('--finetune_jsonl_path', type=str, default='')
 
     # 新增：阶段控制
-    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='lwf',
+    ap.add_argument('--stage', type=str, choices=['pre','lora','replay','lwf','lsat','raie','mole','all'], default='raie',
                     help='选择运行阶段')
     ap.add_argument('--resume_base_dir', type=str, default='',
                     help='已保存的 base_with_new_tokens 路径，不填则使用 output_dir/base_with_new_tokens')
@@ -2379,11 +2379,11 @@ def main():
 
     # 训练
     ap.add_argument('--epochs', type=int, default=5)
-    ap.add_argument('--batch_size', type=int, default=128)
+    ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--warmup_ratio', type=float, default=0.05)
     ap.add_argument('--weight_decay', type=float, default=0.01)
-    ap.add_argument('--fp16', type=bool, default=True)
+    ap.add_argument('--fp16', type=bool, default=False)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--grad_clip', type=float, default=1.0)
     ap.add_argument('--final_token_only_loss', action='store_true', default=True)
@@ -2415,12 +2415,12 @@ def main():
     ap.add_argument('--lsat_short_epochs', type=int, default=3)
 
     # RAIE
-    ap.add_argument("--K", type=int, default=3)
+    ap.add_argument("--K", type=int, default=5)
     ap.add_argument("--q", type=float, default=0.9)
     ap.add_argument("--tau", type=float, default=0.05)
     ap.add_argument("--gamma", type=float, default=0.5)
     ap.add_argument("--gap_thr", type=float, default=0.02)
-    ap.add_argument("--orig_mix_ratio", type=float, default=0.5)
+    ap.add_argument("--orig_mix_ratio", type=float, default=0.7)
     ap.add_argument("--soft_rep_factor", type=int, default=2)
     ap.add_argument("--raie_epochs_per_region", type=int, default=3)
     ap.add_argument("--lambda_anchor", type=float, default=1e-4)
