@@ -4,7 +4,7 @@
 In this work, we aim to make continual recommendation updates more stable and scalable by moving from global fine-tuning to region-level editing. We propose Region-Aware Incremental Editing (RAIE), which freezes the backbone and updates semantically coherent regions with dedicated LoRA adapters for confident routing and precise adaptation.
 
 ## 2. Environment Requirement
-Below are the key packages used across the RAIE codebase with versions from your environment:
+Below are the key packages used across the RAIE codebase with versions from our environment:
 
 - Python 3.9.23
 - torch 2.8.0
