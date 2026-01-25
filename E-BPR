@@ -1,25 +1,3 @@
-# rec_edit_baseline_sasrec.py
-# -*- coding: utf-8 -*-
-"""
-E-BPR Editing Baseline for SASRec (+ your RAIE data format)
-
-功能:
-- 从 Top-K 误推自动挖掘编辑对 (prompt -> bad_item) 或从文件读取
-- 在给定预算步数内进行 E-BPR 小步更新（只改 embedding 或 LoRA B）
-- 评测: Recall/NDCG (before/after) + SR/CR/Concentrated（近似）
-- 与 BERT4Rec 版 edit_baseline.py 完全对齐的输入/输出协议
-
-示例:
-python rec_edit_baseline_sasrec.py \
-  --data_dir /path/to/dataset \
-  --model_dir /path/to/runs/sasrec_yelp/base_model \
-  --output_dir /path/to/runs/sasrec_yelp/edit_baseline \
-  --edit_source from_topk --topk_mine 10 --per_user 2 \
-  --budget_steps 20 --lr 3e-4 --scope embedding --maxlen 50
-
-可选：加载默认 LoRA 适配器 "default/"
-  --load_lora_default
-"""
 import importlib.util
 import sys
 import json
@@ -37,17 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
-# ====== 可选 PEFT / LoRA ======
 try:
     from peft import PeftModel
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
 
-
-# =========================
-# Utils & IO
-# =========================
 def set_seed(seed=42):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -82,19 +55,14 @@ def load_item_ids_map(item_ids_path: str):
         obj = json.load(f)
     vocab = obj["item_ids"] if isinstance(obj, dict) and "item_ids" in obj else obj
     vocab = [int(x) for x in vocab]
-    # SASRec 索引：1..N （0 预留 PAD）
     id2idx = {mid: (i+1) for i, mid in enumerate(sorted(vocab))}
     n_items = len(vocab)
     return id2idx, n_items
 
-
-# =========================
-# Datasets (与 RAIE/SASRec 对齐)
-# =========================
 @dataclass
 class ExampleWin:
-    seq_idx: List[int]  # 1..N
-    tgt_idx: int        # 1..N
+    seq_idx: List[int]
+    tgt_idx: int        
 
 class EvalWindowDataset(Dataset):
     """test.jsonl: {"prompt": "<item_1> <item_23> ...", "target": "<item_999>"}"""
@@ -128,19 +96,9 @@ def eval_collate(batch: List[ExampleWin]):
         ctx_list.append(np.array(ex.seq_idx, dtype=np.int64))
     return {"seq": seq, "tgt": tgt, "ctx": ctx_list}
 
-
-# =========================
-# SASRec Loader
-# =========================
-
 def _import_sasrec_class(py_path: str):
-    """
-    从给定 py 文件路径动态导入 SASRec 类。
-    要求该 py 里暴露类名 `SASRec`，且支持 from_pretrained(model_dir)；
-    若没有 from_pretrained，则需要能手工 new & load_state_dict。
-    """
     if (py_path is None) or (py_path == ""):
-        raise RuntimeError("必须提供 --sasrec_py 指向你的 SASRec 源码文件")
+        raise RuntimeError("必须提供 --model_py 指向你的 SASRec 源码文件")
     if not os.path.isfile(py_path):
         raise FileNotFoundError(f"SASRec 源码不存在: {py_path}")
     mod_name = os.path.splitext(os.path.basename(py_path))[0]
@@ -152,31 +110,17 @@ def _import_sasrec_class(py_path: str):
         raise RuntimeError(f"{py_path} 中未找到类 `SASRec`")
     return mod.SASRec
 
-def load_sasrec_from_pretrained(model_dir: str, device: torch.device, sasrec_py: str):
-    """
-    先尝试调用 SASRec.from_pretrained(model_dir)；
-    若类不支持，则读取 config.json 构造后，再 load_state_dict。
-    需要你训练基座时保存过：base_model.save_pretrained(model_dir)
-    """
-    SASRec = _import_sasrec_class(sasrec_py)
-    # 优先走 from_pretrained
+def load_sasrec_from_pretrained(model_dir: str, device: torch.device, model_py: str):
+    SASRec = _import_sasrec_class(model_py)
     if hasattr(SASRec, "from_pretrained"):
         model = SASRec.from_pretrained(model_dir, map_location=device).to(device)
         model.eval()
         return model
 
-    # fallback: 读取 config.json 构造 -> load_state_dict
     cfg_path = os.path.join(model_dir, "config.json")
     sd_path  = os.path.join(model_dir, "pytorch_model.bin")
-    if (not os.path.isfile(cfg_path)) or (not os.path.isfile(sd_path)):
-        raise RuntimeError(
-            f"在 {model_dir} 未找到 config.json / pytorch_model.bin。"
-            " 如果你的类不支持 from_pretrained，请确保保存了这两份文件。"
-        )
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-
-    # 这些键名需与你的 SASRec __init__ 对齐（参考你训练脚本）
     n_items       = cfg.get("n_items")
     maxlen        = cfg.get("maxlen")
     hidden_units  = cfg.get("hidden_units", 128)
@@ -192,23 +136,13 @@ def load_sasrec_from_pretrained(model_dir: str, device: torch.device, sasrec_py:
         num_blocks=num_blocks, num_heads=num_heads, dropout=dropout
     ).to(device)
     state = torch.load(sd_path, map_location=device)
-    # 兼容 peft 包裹过的 state_dict（有时有 'base_model.' 前缀）
     if any(k.startswith("base_model.") for k in state.keys()):
         state = {k.replace("base_model.", "", 1): v for k, v in state.items()}
     model.load_state_dict(state, strict=True)
     model.eval()
     return model
 
-
-
-# =========================
-# Scoring / Evaluation
-# =========================
 def _final_scores(model, seq_ids: torch.Tensor) -> torch.Tensor:
-    """
-    输入: seq_ids [B, L], 值域: 0(PAD) or 1..N
-    输出: scores [B, N] （列 0..N-1 对应 item_idx 1..N）
-    """
     h = model(seq_ids)  # [B, L, D]
     last = (seq_ids != 0).sum(dim=1).clamp_min(1) - 1
     rows = torch.arange(seq_ids.size(0), device=seq_ids.device)
@@ -255,16 +189,7 @@ def evaluate_windows(model, loader: DataLoader, n_items: int, topk_list: List[in
             n += 1
     return {k: (v / max(1, n)) for k, v in sums.items()}
 
-
-# =========================
-# Edit mining / SR-CR-Concentrated
-# =========================
 def mine_edit_pairs_from_topk_sasrec(model, ds: Dataset, device, topk=10, per_user=2, max_pairs=10000):
-    """
-    从未编辑模型 Top-K 误推中挖 (prompt, bad_item)。
-    保存为:
-      {"user_prompt_idx": [1..N, ...], "bad_item_idx": int(1..N)}
-    """
     loader = DataLoader(ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
     pairs = []
     with torch.no_grad():
@@ -285,10 +210,6 @@ def mine_edit_pairs_from_topk_sasrec(model, ds: Dataset, device, topk=10, per_us
 
 @torch.no_grad()
 def _embed_prompts_sasrec(model, seq: torch.Tensor) -> torch.Tensor:
-    """
-    用 mean pooling 得到 prompt 向量, 再做 L2 归一化。
-    seq: [B, L]
-    """
     h = model(seq)  # [B,L,D]
     mask = (seq != 0).float().unsqueeze(-1)
     v = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
@@ -297,9 +218,6 @@ def _embed_prompts_sasrec(model, seq: torch.Tensor) -> torch.Tensor:
 
 def sr_cr_concentrated_sasrec(model_before, model_after, edit_pairs, device,
                               n_items: int, maxlen: int, topk=10, sim_topM=50):
-    """
-    与 BERT 版同口径的 SR / CR / Concentrated（近似）
-    """
     def build_batch(rows: List[List[int]]):
         B = len(rows)
         L = maxlen
@@ -334,9 +252,8 @@ def sr_cr_concentrated_sasrec(model_before, model_after, edit_pairs, device,
         sr_atK = (ra > topk).float().mean().item()
         delta_rank = (rb - ra).float().mean().item()
 
-    # Collaborative：对每个 prompt 找 sim_topM 个近邻，看坏物品名次提升
     with torch.no_grad():
-        v = _embed_prompts_sasrec(model_after, seq)     # [B,D] (after 的空间更贴近编辑后效果)
+        v = _embed_prompts_sasrec(model_after, seq)
         sims = v @ v.t()
         B = sims.size(0)
         topm = min(sim_topM, max(1, B-1))
@@ -358,8 +275,6 @@ def sr_cr_concentrated_sasrec(model_before, model_after, edit_pairs, device,
             if pos_a.numel() > 0: ranks_a[pos_a[:,0]] = pos_a[:,1] + 1
             cr_list.append((ranks_b - ranks_a).float().mean().item())
         cr = float(np.mean(cr_list)) if len(cr_list)>0 else 0.0
-
-    # Concentrated（近似占位：如需全量评测，建议在随机子集上跑 evaluate_windows 前后差）
     concentrated = {"DeltaNDCG@10": 0.0}
 
     return {
@@ -369,10 +284,6 @@ def sr_cr_concentrated_sasrec(model_before, model_after, edit_pairs, device,
         **concentrated
     }
 
-
-# =========================
-# E-BPR for SASRec
-# =========================
 def select_params_for_scope_sasrec(model, scope: str):
     params=[]
     if scope == "loraB":
@@ -386,7 +297,6 @@ def select_params_for_scope_sasrec(model, scope: str):
         emb = model.item_emb
         emb.weight.requires_grad_(True); params.append(emb.weight)
         return params
-    # 默认冻结
     for p in model.parameters(): p.requires_grad = False
     return params
 
@@ -416,7 +326,6 @@ def ebpr_edit_sasrec(model, edit_pairs, device, n_items: int, maxlen: int,
         batch_pairs = random.sample(edit_pairs, k=bs) if len(edit_pairs) > bs else edit_pairs
         seq, bad_col = build_batch(batch_pairs)
 
-        # 负采样列（保证 != bad）
         neg_cols = torch.randint(0, n_items, (bs, neg_per_step), device=device)
         neg_cols = torch.where(neg_cols==bad_col.view(-1,1), (neg_cols+1)%n_items, neg_cols)
 
@@ -433,19 +342,15 @@ def ebpr_edit_sasrec(model, edit_pairs, device, n_items: int, maxlen: int,
                 torch.nn.utils.clip_grad_norm_(p, grad_clip)
         opt.step()
 
-
-# =========================
-# Main
-# =========================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="/home/zj/code/ml-10M100K",
-                    help="包含 item_ids.json, test.jsonl")
+                    help="contain item_ids.json, test.jsonl")
     ap.add_argument("--model_dir", type=str, default="/home/zj/code/llm_cluster_lora/runs/Bert4Rec_ml10M100K/base_model",
-                    help="Bert4Rec base_model 目录（save_pretrained 的输出）")
+                    help="base model path")
     ap.add_argument("--output_dir", type=str, default="/home/zj/code/llm_cluster_lora/runs/Bert4Rec_ml10M100K/edit_baseline")
-    ap.add_argument("--sasrec_py", type=str, default="/home/zj/code/llm_cluster_lora/Bert4Rec_RAIE_ALL_NEW.py",
-                    help="你的 SASRec 源码文件路径")
+    ap.add_argument("--model_py", type=str, default="/home/zj/code/llm_cluster_lora/Bert4Rec_RAIE_ALL_NEW.py",
+                    help="model_py path")
 
     ap.add_argument("--maxlen", type=int, default=30)
     ap.add_argument("--topk_eval", type=str, default="5,10,20")
@@ -480,11 +385,10 @@ def main():
     eval_loader = DataLoader(eval_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=eval_collate)
 
     # ===== Load SASRec base =====
-    model = load_sasrec_from_pretrained(args.model_dir, device, args.sasrec_py)
+    model = load_sasrec_from_pretrained(args.model_dir, device, args.model_py)
 
     model.eval()
 
-    # 可选：加载默认 LoRA 适配器 default/
     if args.load_lora_default and PEFT_AVAILABLE:
         default_dir = os.path.join(os.path.dirname(args.model_dir), "default")
         if os.path.isdir(default_dir):
@@ -502,7 +406,6 @@ def main():
         rows = read_jsonl(args.edit_pairs)
         edit_pairs = []
         for r in rows:
-            # 支持 user_prompt_idx + bad_item_idx；或 user_prompt + bad_item
             if "user_prompt_idx" in r and "bad_item_idx" in r:
                 edit_pairs.append({"user_prompt_idx": r["user_prompt_idx"], "bad_item_idx": r["bad_item_idx"]})
             else:
@@ -515,7 +418,6 @@ def main():
                 if bad_mid not in id2idx: continue
                 edit_pairs.append({"user_prompt_idx": ctx_idx[-args.maxlen:], "bad_item_idx": id2idx[bad_mid]})
     else:
-        # 从 test 中自动挖误推
         edit_pairs = mine_edit_pairs_from_topk_sasrec(
             model, eval_ds, device, topk=args.topk_mine, per_user=args.per_user, max_pairs=args.max_pairs
         )
@@ -523,7 +425,7 @@ def main():
         print(f"[Mine] got {len(edit_pairs)} edit pairs")
 
     # ===== Clone model (after) =====
-    model_after = load_sasrec_from_pretrained(args.model_dir, device, args.sasrec_py)
+    model_after = load_sasrec_from_pretrained(args.model_dir, device, args.model_py)
 
     if args.load_lora_default and PEFT_AVAILABLE:
         default_dir = os.path.join(os.path.dirname(args.model_dir), "default")
