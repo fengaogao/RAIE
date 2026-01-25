@@ -315,12 +315,15 @@ def collate_batch(batch, pad_id: int):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "target_item_idx": target_item_idx}
 
 class SeqRecDatasetFromPairs(Dataset):
-    def __init__(self, jsonl_path: str, mid2idx: Dict[int,int],
-                 tokenizer, item_token_seq: List[List[str]], max_history: int = 50,
-                 wrap_mode: str = 'none',
-                 final_token_only_loss: bool = True,
-                 deterministic_template: bool = False):
-        assert wrap_mode in ('none',)
+    def __init__(
+        self,
+        jsonl_path: str,
+        mid2idx: Dict[int, int],
+        tokenizer,
+        item_token_seq: List[List[str]],
+        max_history: int = 50,
+        final_token_only_loss: bool = True,
+    ):
         self.examples = []
         self.tok = tokenizer
         self.item_token_seq = item_token_seq
@@ -1496,9 +1499,8 @@ def make_datasets_for_stage(args, tok, mid2idx, n_items):
     def make_ds(jsonl_path):
         return SeqRecDatasetFromPairs(
             jsonl_path, mid2idx, tok, item_token_seq,
-            max_history=args.max_history, wrap_mode="none",
+            max_history=args.max_history,
             final_token_only_loss=args.final_token_only_loss,
-            deterministic_template=True
         )
 
     train_jsonl_path = args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl")
@@ -1600,9 +1602,8 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     def make_ds(jsonl_path):
         return SeqRecDatasetFromPairs(
             jsonl_path, mid2idx, tok, item_token_seq,
-            max_history=args.max_history, wrap_mode="none",
+            max_history=args.max_history,
             final_token_only_loss=args.final_token_only_loss,
-            deterministic_template=True
         )
 
     ds_trainO = make_ds(args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl"))
