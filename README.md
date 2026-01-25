@@ -18,23 +18,23 @@ Below are the key packages used across the RAIE codebase with versions from our 
 
 ## 3. File descriptions and run examples
 
+- `ml_data_load.py`: Utility script for loading data and constructing sequences.
+  - Example: `python ml_data_load.py --data_dir ./data/ --output_dir ./runs/RAIEmodel_dataprep --max_len 50`
+
+- `Bert4Rec_RAIE.py`: RAIE pipeline for Bert4Rec using an MLM objective for sequential recommendation and region updates.
+  - Example: `python Bert4Rec_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_bert4rec --maxlen 50 --hidden_units 128`
+
 - `SASRec_RAIE.py`: RAIE training and incremental editing flow for SASRec, including region construction and routing.
   - Example: `python SASRec_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_sasrec --maxlen 50 --hidden_units 128`
 
 - `TiSASRec_RAIE.py`: RAIE implementation for TiSASRec with time-interval modeling in sequential recommendation.
   - Example: `python TiSASRec_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_tisasrec --maxlen 50 --hidden_units 128`
 
-- `Bert4Rec_RAIE.py`: RAIE pipeline for Bert4Rec using an MLM objective for sequential recommendation and region updates.
-  - Example: `python Bert4Rec_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_bert4rec --maxlen 50 --hidden_units 128`
-
 - `openP5_RAIE.py`: RAIE for LLM-based recommendation with openP5-style prompt/target data.
   - Example: `python openP5_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_openp5 --model_name_or_path RAIEmodel`
 
 - `E-BPR.py`: E-BPR editing/retraining script based on SASRec representations for mining or applying edit pairs.
   - Example: `python E-BPR.py --data_dir ./data/ --model_dir ./runs/RAIEmodel_sasrec --output_dir ./runs/RAIEmodel_ebpr --model_py SASRec_RAIE.py --edit_source from_topk`
-
-- `ml_data_load.py`: Utility script for loading data and constructing sequences.
-  - Example: `python ml_data_load.py --data_dir ./data/ --output_dir ./runs/RAIEmodel_dataprep --max_len 50`
 
 ## 4. Dataset
 
