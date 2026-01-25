@@ -13,10 +13,6 @@ def save_jsonl(path, rows):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 def load_mlm1m_ratings(ratings_path: str) -> Dict[int, List[Tuple[int, int]]]:
-    """
-    返回：user2seq 字典： uid -> [(movieId, timestamp), ...] （按时间升序）
-    ratings.dat: UserID::MovieID::Rating::Timestamp
-    """
     user2seq = {}
     with open(ratings_path, "r", encoding="latin-1") as f:
         for line in f:
@@ -26,23 +22,17 @@ def load_mlm1m_ratings(ratings_path: str) -> Dict[int, List[Tuple[int, int]]]:
             uid = int(parts[0]); mid = int(parts[1]); rating = float(parts[2]); ts = int(parts[3])
             if rating >= 4.0:
                 user2seq.setdefault(uid, []).append((mid, ts))
-    # sort by timestamp
     for u in user2seq:
         user2seq[u].sort(key=lambda x: x[1])
     return user2seq
 
 def sliding_windows(seq: List[str], win_len: int, stride: int = 1, align: str = "end"):
-    """
-    右对齐滑窗：确保最后一次交互（seq[-1]）作为目标被包含。
-    返回: (ctx, tgt, tgt_idx)
-    """
     n = len(seq)
     if n < win_len:
         return
     if align == "end":
-        # 让 range() 的最后一个 i 命中 n - win_len
         start = (n - win_len) % stride
-    else:  # "start"
+    else: 
         start = 0
 
     for i in range(start, n - win_len + 1, stride):
@@ -58,13 +48,11 @@ def build_examples_global_time_split(
     q_test_start: float = 0.8
 ):
     ts_all = np.array([ts for pairs in user2seq.values() for _, ts in pairs], dtype=np.int64)
-    assert ts_all.size > 0, "没有可用时间戳。"
     t0 = int(np.quantile(ts_all, q_orig))
     t1 = int(np.quantile(ts_all, q_test_start))
     if t1 <= t0: t1 = t0 + 1
 
     original, finetune, test = [], [], []
-    # --- NEW: per-block stats containers ---
     users_o, items_o, inter_o = set(), set(), 0
     users_f, items_f, inter_f = set(), set(), 0
     users_t, items_t, inter_t = set(), set(), 0
@@ -72,11 +60,9 @@ def build_examples_global_time_split(
     original_stride1 = []
     all_items = set()
 
-    # 2) 逐用户：把序列切成三段，再各自滑窗
     for uid, pairs in user2seq.items():
         tss = [ts for _, ts in pairs]
 
-        # 三段子序列（保持原有时间顺序）
         mids_o = [m for m, ts in pairs if ts < t0]
         tss_o = [ts for ts in tss if ts < t0]
 
@@ -103,9 +89,7 @@ def build_examples_global_time_split(
             inter_t += len(mids_t)
 
 
-        # Original：仅在 O 段滑窗
         if len(mids_o) >= win_len:
-            # 生成目标索引，与滑窗对齐：target_idx = i + win_len - 1
             for (ctx, tgt, tgt_idx) in sliding_windows(mids_o, win_len, stride, align="end"):
                 ts = tss_o[tgt_idx]
                 prompt = " ".join(format_item_token(m) for m in ctx)
@@ -129,7 +113,6 @@ def build_examples_global_time_split(
                 all_items.update(ctx);
                 all_items.add(tgt)
 
-        # Finetune：仅在 F 段滑窗（不会带入 Original 历史）
         if len(mids_f) >= win_len:
             for (ctx, tgt, tgt_idx) in sliding_windows(mids_f, win_len, stride, align="end"):
                 ts = tss_f[tgt_idx]
@@ -142,7 +125,6 @@ def build_examples_global_time_split(
                 all_items.update(ctx);
                 all_items.add(tgt)
 
-        # Test：仅在 T 段滑窗（不会带入 Original / Finetune 历史）
         if len(mids_t) >= win_len:
             for (ctx, tgt, tgt_idx) in sliding_windows(mids_t, win_len, stride, align="end"):
                 ts = tss_t[tgt_idx]
@@ -155,7 +137,6 @@ def build_examples_global_time_split(
                 all_items.update(ctx);
                 all_items.add(tgt)
 
-    # --- NEW: pack stats ---
     stats = {
         "O": {"users": len(users_o), "items": len(items_o), "interactions": inter_o},
         "F": {"users": len(users_f), "items": len(items_f), "interactions": inter_f},
@@ -168,7 +149,6 @@ def build_examples_global_time_split(
         "t0": t0, "t1": t1,
         "stats": stats,  # <-- NEW
     }
-
 
 def save_stream(path, user2seq: Dict[int, List[Tuple[int,int]]], t0: int, t1: int, which: str):
     """
@@ -184,7 +164,7 @@ def save_stream(path, user2seq: Dict[int, List[Tuple[int,int]]], t0: int, t1: in
             seg = [(m,ts) for m,ts in pairs if t0 <= ts < t1]
         else:
             raise ValueError("which must be 'original' or 'finetune'")
-        if len(seg) < 2:   # 至少要有序列
+        if len(seg) < 2:  
             continue
         mids = [m for m,_ in seg]
         tss  = [ts for _,ts in seg]
@@ -197,9 +177,9 @@ def save_stream(path, user2seq: Dict[int, List[Tuple[int,int]]], t0: int, t1: in
 
 def main():
     args = argparse.ArgumentParser()
-    args.add_argument("--data_dir", type=str, default="/home/zj/code/ml-10M100K/")
-    args.add_argument("--output_dir", type=str, default="/home/zj/code/ml-10M100K/")
-    args.add_argument("--max_len", type=int, default=10)
+    args.add_argument("--data_dir", type=str, default="")
+    args.add_argument("--output_dir", type=str, default="")
+    args.add_argument("--max_len", type=int, default="")
     args.add_argument("--save_stream", action="store_true", default=True)
     args = args.parse_args()
     ratings_path = os.path.join(args.data_dir, "ratings.dat")
@@ -210,7 +190,6 @@ def main():
 
     print("Building examples ...")
     pack = build_examples_global_time_split(user2seq, win_len=args.max_len+1, stride=5, q_orig=0.5, q_test_start=0.8)
-    # --- NEW: pretty print stats ---
     s = pack["stats"]
     print("[Block Stats]")
     print(f"O: users={s['O']['users']}, items={s['O']['items']}, interactions={s['O']['interactions']}")
@@ -232,8 +211,6 @@ def main():
                     which="original")
         save_stream(os.path.join(args.output_dir, "finetune_stream.jsonl"), user2seq, pack["t0"], pack["t1"],
                     which="finetune")
-
-    # item 词表和元信息（含 t0/t1）
     with open(os.path.join(args.output_dir, "item_ids.json"), "w", encoding="utf-8") as f:
         json.dump({"item_ids": item_ids}, f, ensure_ascii=False)
 
@@ -254,6 +231,5 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
-
 if __name__ == "__main__":
     main()
