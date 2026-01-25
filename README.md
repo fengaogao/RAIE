@@ -45,7 +45,7 @@ Below are the key packages used across the RAIE codebase with versions from your
 - `finetune.jsonl`: Sliding-window prompt/target pairs from the finetune (F) time block.
 - `test.jsonl`: Sliding-window prompt/target pairs from the test (T) time block.
 - `item_ids.json`: All item IDs observed in the generated splits.
-- `meta.json`: Counts, time boundaries (`t0`, `t1`), and schema metadata.
+- `meta.json`: Counts, time boundaries (`t^s`, `t^F`), and schema metadata.
 
 ### 4.2 Download links
 
