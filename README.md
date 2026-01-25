@@ -1,7 +1,7 @@
 # RAIE
 
 ## 1. Introduction
-In this work, we aim to make continual recommendation updates more stable and scalable by moving from global fine-tuning to region-level editing. We propose Region-Aware Incremental Editing (RAIE), which freezes the backbone and updates semantically coherent regions with dedicated adapters for confident routing and precise adaptation.
+In this work, we aim to make continual recommendation updates more stable and scalable by moving from global fine-tuning to region-level editing. We propose Region-Aware Incremental Editing (RAIE), which freezes the backbone and updates semantically coherent regions with dedicated LoRA adapters for confident routing and precise adaptation.
 
 ## 2. Environment Requirement
 Below are the key packages used across the RAIE codebase with versions from your environment:
@@ -40,12 +40,12 @@ Below are the key packages used across the RAIE codebase with versions from your
 
 ### 4.1 `ml_data_load.py` outputs
 
-- `original.jsonl`: Sliding-window prompt/target pairs from the original (O) time block.
+- `original.jsonl`: Sliding-window prompt/target pairs from the Set-up (S) time block.
 - `original_stride1.jsonl`: Same as `original.jsonl`, but generated with stride 1 for dense routing.
 - `finetune.jsonl`: Sliding-window prompt/target pairs from the finetune (F) time block.
 - `test.jsonl`: Sliding-window prompt/target pairs from the test (T) time block.
 - `item_ids.json`: All item IDs observed in the generated splits.
-- `meta.json`: Counts, time boundaries (`t^s`, `t^F`), and schema metadata.
+- `meta.json`: Counts, time boundaries (`t^S`, `t^F`), and schema metadata.
 
 ### 4.2 Download links
 
