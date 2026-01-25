@@ -1,9 +1,10 @@
-import os
+import argparse
+import importlib.util
 import json
 import math
-import argparse
+import os
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -14,13 +15,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 from torch.nn.utils import clip_grad_norm_
 
-# ---- NEW: PEFT / LoRA ----
-try:
-    from peft import LoraConfig, get_peft_model, TaskType
-    PEFT_AVAILABLE = True
-except Exception as e:
-    PEFT_AVAILABLE = False
-    _PEFT_ERR = e
+PEFT_AVAILABLE = importlib.util.find_spec("peft") is not None
+if PEFT_AVAILABLE:
+    from peft import LoraConfig, TaskType, get_peft_model
+else:
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 
 # ------------------------------
 # Utils
@@ -28,8 +29,10 @@ except Exception as e:
 
 def set_seed(seed: int = 42):
     import random
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -100,7 +103,7 @@ class Example:
 
 
 class SeqDataset(Dataset):
-    # 测试/微调：从 finetune.jsonl / test.jsonl 读取 prompt/target/prompt_ts
+    """Read prompt/target data from finetune.jsonl or test.jsonl."""
     def __init__(self, jsonl_path: str):
         rows = read_jsonl(jsonl_path)
         self.examples: List[Example] = []
@@ -126,10 +129,10 @@ class SeqDataset(Dataset):
 
 class StreamPairDataset(Dataset):
     """
-    O阶段训练：original_stream.jsonl（每行一位用户完整序列），
-    在线滑窗生成 (prompt -> target) 样本。
-    每行格式例：
-      {"user_id": ..., "items": "<item_a> <item_b> ...", "timestamps": "t_a t_b ..."}  # timestamps 可缺省
+    O-stage training dataset from original_stream.jsonl (one full user sequence per line),
+    using a sliding window to generate (prompt -> target) samples.
+    Example line:
+      {"user_id": ..., "items": "<item_a> <item_b> ...", "timestamps": "t_a t_b ..."}
     """
     def __init__(self, jsonl_path: str, stride: int = 1, min_ctx: int = 1):
         rows = read_jsonl(jsonl_path)
@@ -177,7 +180,8 @@ class Collator:
         return self.tok2id.get(t, self.tok2id['[UNK]'])
 
     def __call__(self, batch: List[Example]):
-        B = len(batch); L = self.max_len
+        B = len(batch)
+        L = self.max_len
         seq = torch.full((B, L), self.pad_id, dtype=torch.long)
         ts = torch.zeros((B, L), dtype=torch.long)
         labels = torch.full((B,), -100, dtype=torch.long)       # ignore by default
@@ -189,7 +193,7 @@ class Collator:
             seq[i, :l] = torch.tensor(ids, dtype=torch.long)
             seqlen[i] = l
             lab = self._enc(ex.target_token)
-            labels[i] = lab if lab in self.item_id_set else -100  # 只接收 item 目标
+            labels[i] = lab if lab in self.item_id_set else -100
 
             if ex.prompt_ts is not None:
                 tlist = ex.prompt_ts[-L:]
@@ -453,10 +457,6 @@ class ReplayBuffer:
             self.it = iter(self.loader)
             return next(self.it)
 
-@torch.no_grad()
-def _clone_params(model: nn.Module):
-    return {n: p.detach().clone() for n,p in model.named_parameters() if p.requires_grad}
-
 def _masked_item_logits(logits: torch.Tensor, item_token_ids: List[int]) -> torch.Tensor:
     V = logits.size(1)
     mask_vec = torch.full((V,), float('-inf'), device=logits.device)
@@ -510,18 +510,23 @@ def _sample_negatives_for_batch(seq: torch.Tensor, labels: torch.Tensor,
     for i in range(B):
         ctx = [int(x) for x in seq[i].tolist() if (x != pad_id and x in item_set)]
         tgt = int(labels[i].item())
-        deny = set(ctx); deny.add(tgt)
+        deny = set(ctx)
+        deny.add(tgt)
         while True:
             cand = int(item_token_ids[np.random.randint(0, len(item_token_ids))])
             if cand not in deny:
-                neg[i] = cand; break
+                neg[i] = cand
+                break
     return neg
 
 def lwf_kd_loss_tisasrec(student: nn.Module, teacher: TiSASRec,
                          batch: dict, pad_id: int,
                          item_token_ids: List[int], T: float=2.0, alpha: float=0.5):
-    seq = batch['seq']; t_bk = batch['t_buckets']; attn_mask = batch['attn_mask']
-    labels = batch['labels']; seqlen = batch['seqlen']
+    seq = batch['seq']
+    t_bk = batch['t_buckets']
+    attn_mask = batch['attn_mask']
+    labels = batch['labels']
+    seqlen = batch['seqlen']
     device = seq.device
 
     with torch.no_grad():
@@ -685,9 +690,12 @@ def train_one_epoch(model: TiSASRec, loader: DataLoader, optimizer, scheduler,
         logits = _masked_item_logits(logits, item_token_ids)
         loss = F.cross_entropy(logits, labels, ignore_index=-100)
 
-        optimizer.zero_grad(set_to_none=True); loss.backward()
-        if grad_clip and grad_clip > 0: clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step(); scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        scheduler.step()
         losses.append(float(loss.detach().item()))
     return np.mean(losses) if losses else 0.0
 
@@ -699,7 +707,7 @@ def finetune_one_epoch(model: nn.Module, ft_loader: DataLoader, optimizer, sched
                        replay_ratio: float = 0.3, lwf_T: float = 2.0, lwf_alpha: float = 0.5,
                        E0=None, ids_t=None, lambda_anchor: float = 0.0):
     """
-    支持：裸 TiSASRec 或 PeftModel(TiSASRec)。接口保持一致。
+    Supports TiSASRec or PeftModel(TiSASRec) with a shared interface.
     """
     model.train()
     losses = []
@@ -721,7 +729,7 @@ def finetune_one_epoch(model: nn.Module, ft_loader: DataLoader, optimizer, sched
             reg = (emb.weight.index_select(0, ids_t) - E0.index_select(0, ids_t)).pow(2).mean()
             loss = loss + lambda_anchor * reg
 
-        # Replay: mix O-batch损失
+        # Replay: mix O-stage loss
         if ('replay' in plugin) and (replay_buf is not None):
             rb = replay_buf.next_batch()
             rseq = rb['seq'].to(device)
@@ -743,14 +751,17 @@ def finetune_one_epoch(model: nn.Module, ft_loader: DataLoader, optimizer, sched
                                       T=lwf_T, alpha=lwf_alpha)
             loss = loss + kd
 
-        # EWC（五模式不启用，但保留接口）
+        # EWC (disabled in five-mode setup, kept for compatibility)
         if ('ewc' in plugin) and (ewc_state is not None):
             loss = loss + ewc_loss(model, ewc_state['fisher'], ewc_state['prev_params'], ewc_state['lam'])
 
-        optimizer.zero_grad(set_to_none=True); loss.backward()
-        if grad_clip and grad_clip > 0: clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        if scheduler is not None: scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         losses.append(float(loss.detach().item()))
     return np.mean(losses) if losses else 0.0
 
@@ -758,7 +769,8 @@ def finetune_one_epoch(model: nn.Module, ft_loader: DataLoader, optimizer, sched
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device, pad_id, item_token_ids, topk):
     model.eval()
-    sumd = {k:{'hit':0.0,'dcg':0.0} for k in topk}; N = 0
+    sumd = {k: {'hit': 0.0, 'dcg': 0.0} for k in topk}
+    N = 0
     for batch in tqdm(loader, desc='Eval', leave=False):
         seq = batch['seq'].to(device)
         t_bk = batch['t_buckets'].to(device)
@@ -809,7 +821,8 @@ def evaluate_lsat_tisas(
     topk: Tuple[int, ...] = (5, 10, 20),
 ):
     alpha = float(max(0.0, min(1.0, alpha)))
-    sumd = {k:{'hit':0.0,'dcg':0.0} for k in topk}; N = 0
+    sumd = {k: {'hit': 0.0, 'dcg': 0.0} for k in topk}
+    N = 0
 
     for batch in tqdm(loader, desc='Eval-LSAT', leave=False):
         seq = batch['seq'].to(device)
@@ -841,7 +854,8 @@ def evaluate_mole_tisas(
     topk: Tuple[int, ...] = (5, 10, 20),
 ):
     mole_model.eval()
-    sumd = {k:{'hit':0.0,'dcg':0.0} for k in topk}; N = 0
+    sumd = {k: {'hit': 0.0, 'dcg': 0.0} for k in topk}
+    N = 0
     for batch in tqdm(loader, desc='Eval-MoLE', leave=False):
         seq = batch['seq'].to(device)
         t_bk = batch['t_buckets'].to(device)
@@ -875,7 +889,8 @@ def spherical_kmeans(X: np.ndarray, K: int, niter=30, seed=42):
                           verbose=True, spherical=True, seed=seed)
         km.train(X.astype(np.float32))
         C = km.centroids.astype(np.float32)
-        index = faiss.IndexFlatIP(X.shape[1]); index.add(C)
+        index = faiss.IndexFlatIP(X.shape[1])
+        index.add(C)
         _, lab = index.search(X, 1)
         return C, lab.reshape(-1).astype(np.int32)
     except Exception:
@@ -886,7 +901,8 @@ def spherical_kmeans(X: np.ndarray, K: int, niter=30, seed=42):
         return C.astype(np.float32), lab.astype(np.int32)
 
 def per_cluster_radius(X, C, labels, q=0.9):
-    K = C.shape[0]; R = np.zeros(K, np.float32)
+    K = C.shape[0]
+    R = np.zeros(K, np.float32)
     for k in range(K):
         idx = np.where(labels == k)[0]
         if len(idx) == 0: continue
@@ -896,7 +912,8 @@ def per_cluster_radius(X, C, labels, q=0.9):
     return R
 
 def per_cluster_ang_std(X, C, labels):
-    K = C.shape[0]; sig = np.zeros(K, np.float32)
+    K = C.shape[0]
+    sig = np.zeros(K, np.float32)
     for k in range(K):
         idx = np.where(labels == k)[0]
         if len(idx) == 0: continue
@@ -916,7 +933,8 @@ def enforce_separation(C: np.ndarray, R: np.ndarray, eps_margin=0.03, iters=1):
                 s = R[i] + R[j]
                 if s > limit and s > 1e-8:
                     scale = limit / s
-                    R[i] *= scale; R[j] *= scale
+                    R[i] *= scale
+                    R[j] *= scale
                     changed = True
         if not changed: break
     return R
@@ -925,7 +943,7 @@ def enforce_separation(C: np.ndarray, R: np.ndarray, eps_margin=0.03, iters=1):
 def encode_prompts_to_vecs_tisasrec(model: nn.Module, dataset: Dataset, collate_fn,
                                     pad_id: int, device, batch_size=256, use_mean_pool=True, pbar=False):
     """
-    用 TiSASRec 的隐状态对 (prompt -> target) 的 prompt 做表征。
+    Encode prompt representations using TiSASRec hidden states.
     """
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
     vecs = []
@@ -950,11 +968,11 @@ def encode_prompts_to_vecs_tisasrec(model: nn.Module, dataset: Dataset, collate_
 
 class RegionBankTiSAS:
     """
-    将 RAIE 逻辑封装为 TiSASRec 的插件：
-      - original 上做聚类，统计 vMF 先验（mu/kappa/pi）
-      - finetune 样本路由 Update/Expand/Add
-      - 每个 region 训练专属 LoRA（混入对应 original 样本 + 边界软样本）
-      - 测试时按后验分数路由到 region 适配器做预测
+    Wrap RAIE logic for TiSASRec:
+      - cluster original data to estimate vMF priors (mu/kappa/pi)
+      - route finetune samples via update/expand/add
+      - train region-specific LoRA adapters with original + boundary soft samples
+      - route to region adapters at evaluation time
     """
     def __init__(self, model: nn.Module, pad_id: int, item_token_ids: List[int],
                  collate_fn, original_ds: Dataset,
@@ -972,7 +990,8 @@ class RegionBankTiSAS:
         self.out_dir = out_dir
 
         # clustering / posterior
-        self.K = K; self.q = q
+        self.K = K
+        self.q = q
         self.beta_post = beta_post
         self.delta_min = delta_min
         self.n0 = n0
@@ -987,10 +1006,14 @@ class RegionBankTiSAS:
         )
 
         # state
-        self.C = None; self.R = None; self.sig = None
+        self.C = None
+        self.R = None
+        self.sig = None
         self.C0 = None
-        self.S = None; self.n = None
-        self.kappa = None; self.pi = None
+        self.S = None
+        self.n = None
+        self.kappa = None
+        self.pi = None
         self.orig_idx_by_k = {}
 
     # ---------- clustering on original ----------
@@ -1018,7 +1041,8 @@ class RegionBankTiSAS:
         self.S = np.zeros((K, H), np.float32)
         self.n = np.zeros((K,), np.float32)
         for i, k in enumerate(labels.astype(int)):
-            self.S[k] += X[i]; self.n[k] += 1.0
+            self.S[k] += X[i]
+            self.n[k] += 1.0
         self._recompute_mu_kappa_pi()
 
     def _recompute_mu_kappa_pi(self):
@@ -1034,7 +1058,7 @@ class RegionBankTiSAS:
 
         d = C_new.shape[1]
         r = (normS.squeeze(-1)) / np.maximum(n_hat, 1e-6)
-        # 数值安全：r ∈ (0,1)
+        # Numerical stability: r in (0, 1).
         r = np.clip(r, 1e-6, 1 - 1e-6)
         kappa_new = (r * (d - r ** 2)) / np.clip(1.0 - r ** 2, 1e-6, None)
         kappa_new = np.clip(kappa_new, 1.0, 1e6).astype(np.float32)
@@ -1049,7 +1073,7 @@ class RegionBankTiSAS:
                 new_kappa[:n_old] = self.kappa[:n_old]
                 new_kappa[n_old:] = kappa_new[n_old:]
                 self.kappa = new_kappa
-            # 再做 EMA
+            # Apply EMA.
             self.kappa = (1.0 - self.kappa_ema) * self.kappa + self.kappa_ema * kappa_new
 
         nsum = float(np.maximum(n_hat.sum(), 1.0))
@@ -1069,15 +1093,15 @@ class RegionBankTiSAS:
             self.C0 = self.C.copy().astype(np.float32)
 
         if self.C0.shape[0] < K:
-            # 用新增 S 行的方向来补 C0，而不是用尚未扩容的 self.C
-            S_ex = self.S[self.C0.shape[0]:K, :]  # 形状 (K-C0, H)
+            # Fill C0 using new S rows, rather than the pre-expanded C.
+            S_ex = self.S[self.C0.shape[0]:K, :]  # Shape: (K - C0, H)
             norms = np.linalg.norm(S_ex, axis=1, keepdims=True)
             safe = (norms > 1e-12).astype(np.float32)
             extra = np.zeros_like(S_ex, dtype=np.float32)
             if safe.sum() > 0:
                 extra[safe.squeeze(-1) > 0] = (S_ex[safe.squeeze(-1) > 0] /
                                                (norms[safe.squeeze(-1) > 0] + 1e-12)).astype(np.float32)
-            # fallback：如果某些行全零，用当前 C 的均值方向
+            # Fallback: if some rows are zero, use the mean direction of current C.
             if np.any(~np.isfinite(extra)) or (safe.sum() < (K - self.C0.shape[0])):
                 mean_mu = np.mean(self.C, axis=0, keepdims=True)
                 mean_mu = mean_mu / (np.linalg.norm(mean_mu, axis=1, keepdims=True) + 1e-12)
@@ -1111,7 +1135,8 @@ class RegionBankTiSAS:
         k2, k1 = int(top2[0]), int(top2[1])
         s1, s2 = float(scores[k1]), float(scores[k2])
         z = scores - scores.max()
-        p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
+        p = np.exp(self.beta_post * z)
+        p = p / (p.sum() + 1e-8)
         return k1, k2, s1, s2, float(p[k1]), float(p[k2])
 
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
@@ -1142,20 +1167,22 @@ class RegionBankTiSAS:
             act, k1, k2, p1, p2 = self._decide_action(x)
             if act == "update":
                 buckets[k1].append(i)
-                self.S[k1] += x; self.n[k1] += 1.0
+                self.S[k1] += x
+                self.n[k1] += 1.0
             elif act == "expand":
                 buckets[k1].append(i)
                 s = p1 + p2 + 1e-8
                 w1, w2 = p1 / s, p2 / s
                 soft_pairs.append((i, k1, k2, float(w1), float(w2)))
-                self.S[k1] += 0.25 * x; self.n[k1] += 0.25
+                self.S[k1] += 0.25 * x
+                self.n[k1] += 0.25
             else:
                 add_pool.append((i, k1))
                 soft_pairs.append((i, k1, k2, 0.3, 0.0))
 
         self._recompute_mu_kappa_pi()
 
-        # 试建新簇（简化）
+        # Try creating new clusters (simplified).
         if len(add_pool) >= pool_min:
             add_idx = [idx for (idx, _k1) in add_pool]
             Xp = Xn[add_idx]
@@ -1190,7 +1217,8 @@ class RegionBankTiSAS:
     def _propose_new_centers(self, Xp: np.ndarray, max_new=2):
         cand = []
         if Xp.shape[0] == 0: return cand
-        mu1 = Xp.mean(0); mu1 /= (np.linalg.norm(mu1) + 1e-12)
+        mu1 = Xp.mean(0)
+        mu1 /= (np.linalg.norm(mu1) + 1e-12)
         cand.append(mu1.astype(np.float32))
         if Xp.shape[0] >= 50 and max_new >= 2:
             C2, _ = spherical_kmeans(Xp, 2, niter=20, seed=42)
@@ -1216,7 +1244,7 @@ class RegionBankTiSAS:
 
         w = np.maximum(score_new.mean(0), 1e-6)
         w = w / (w.sum() + 1e-8)
-        eps = 0.10  # 可调
+        eps = 0.10  # Tunable.
         all_mu = np.vstack([self.C, addC])
         all_kappa = np.concatenate([self.kappa, kappa_new])
         all_pi = np.concatenate([self.pi * (1 - eps), w * eps])
@@ -1227,7 +1255,8 @@ class RegionBankTiSAS:
         ll_new = float(np.max(scores_all, axis=1).sum())
 
         d = Xp.shape[1]
-        K0 = self.C.shape[0]; K1 = K0 + len(centers)
+        K0 = self.C.shape[0]
+        K1 = K0 + len(centers)
         bic_old = ll_old - 0.5 * (K0 * d) * np.log(Xp.shape[0] + 1e-8)
         bic_new = ll_new - 0.5 * (K1 * d) * np.log(Xp.shape[0] + 1e-8)
         return (bic_new - bic_old) > bic_gain
@@ -1244,8 +1273,10 @@ class RegionBankTiSAS:
         merged = 0
         for _, i, j in pairs:
             if i >= self.C.shape[0] or j >= self.C.shape[0]: continue
-            Sij = self.S[i] + self.S[j]; nij = self.n[i] + self.n[j]
-            self.S[i] = Sij; self.n[i] = nij
+            Sij = self.S[i] + self.S[j]
+            nij = self.n[i] + self.n[j]
+            self.S[i] = Sij
+            self.n[i] = nij
             self.S = np.delete(self.S, j, axis=0)
             self.n = np.delete(self.n, j, axis=0)
             self.C = np.delete(self.C, j, axis=0)
@@ -1280,8 +1311,6 @@ class RegionBankTiSAS:
                 soft_idx_by_k[k1].extend([i] * max(0, int(round(w1 * soft_rep_factor))))
             if w2 > 0:
                 soft_idx_by_k[k2].extend([i] * max(0, int(round(w2 * soft_rep_factor))))
-
-        no_decay = ['bias', 'LayerNorm.weight']
 
         for k, idx_list in sorted(region_buckets.items(), key=lambda kv: -len(kv[1])):
             if len(idx_list) == 0: continue
@@ -1339,7 +1368,8 @@ class RegionBankTiSAS:
 
                     optim.zero_grad(set_to_none=True)
                     loss.backward()
-                    optim.step(); sched.step()
+                    optim.step()
+                    sched.step()
                     pbar.set_postfix({"loss": float(loss.detach().cpu())})
 
             save_dir = os.path.join(self.out_dir, f"adapter_region_{k}")
@@ -1375,7 +1405,8 @@ class RegionBankTiSAS:
             sub = Subset(test_ds, idx_by_k[k])
             dl = DataLoader(sub, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
             stat = eval_fn(self.model, dl, self.device, pad_id, item_token_ids, k_list)
-            stat["cluster_id"] = int(k); stat["num_samples"] = len(sub)
+            stat["cluster_id"] = int(k)
+            stat["num_samples"] = len(sub)
             all_stats.append(stat)
         return all_stats
 
@@ -1386,10 +1417,9 @@ class RegionBankTiSAS:
 
 def main():
     ap = argparse.ArgumentParser()
-    # 新增：模式开关
     ap.add_argument('--mode', type=str, default='raie',
                     choices=['base', 'lora', 'lora_replay', 'lora_lwf', 'lsat', 'raie', 'mole'],
-                    help='方案：base / lora / lora_replay / lora_lwf / lsat / raie / mole')
+                    help='Mode: base / lora / lora_replay / lora_lwf / lsat / raie / mole')
 
     ap.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/')
     ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_yelp')
@@ -1419,7 +1449,7 @@ def main():
     ap.add_argument('--finetune_batch_size', type=int, default=512)
     ap.add_argument('--finetune_lr', type=float, default=5e-4)
 
-    # Plugins（五模式里只用 replay / lwf；保留 ewc 参数但不走该分支）
+    # Plugins (only replay/lwf used; ewc arguments kept for compatibility).
     ap.add_argument('--plugin', type=str, default='none',
                     choices=['none','replay','ewc','lwf','replay+ewc','lwf+ewc','replay+lwf','replay+lwf+ewc'])
     ap.add_argument('--replay_ratio', type=float, default=0.3)
@@ -1437,7 +1467,7 @@ def main():
     ap.add_argument('--lora_dropout', type=float, default=0.05)
     ap.add_argument('--lora_target', type=str,
                     default='Wq,Wk,Wv,Wo,ffn.0,ffn.3',
-                    help='逗号分隔的模块名（支持子串匹配），例如 "Wq,Wk,Wv,Wo,ffn.0,ffn.3"')
+                    help='Comma-separated module names (substring match), e.g. "Wq,Wk,Wv,Wo,ffn.0,ffn.3"')
 
     # ---- LSAT args ----
     ap.add_argument('--lsat_alpha', type=float, default=0.6, help='Long-term adapter weight for LSAT logit fusion')
@@ -1451,7 +1481,7 @@ def main():
     ap.add_argument('--mole_balance', type=float, default=0.01, help='KL regularization weight for balanced routing')
 
     # ===== RAIE plugin switches =====
-    ap.add_argument('--raie_enable', action='store_true', default=True, help='启用 RAIE 区域化 LoRA 插件')
+    ap.add_argument('--raie_enable', action='store_true', default=True, help='Enable RAIE regional LoRA plugin')
     ap.add_argument('--raie_K', type=int, default=3)
     ap.add_argument('--raie_q', type=float, default=0.9)
     ap.add_argument('--raie_pool_min', type=int, default=120)
@@ -1464,13 +1494,13 @@ def main():
     ap.add_argument('--raie_kappa_ema', type=float, default=0.2)
     ap.add_argument('--raie_lam_new', type=float, default=-1.0)
 
-    # 可选护栏：是否允许“全参微调”触发 Stage-F（默认为 False，用于 base 模式避免误触）
+    # Optional guardrail: allow full-parameter finetune to trigger Stage F (default False).
     ap.add_argument('--enable_full_finetune', action='store_true', default=False)
 
     args = ap.parse_args()
 
-    # ---------- 模式到内部开关的映射（不改变模块内逻辑，只调流程） ----------
-    # 统一禁用 EWC；RAIE 独立由 raie_enable 控制
+    # ---------- Mode-to-flag mapping (flow only, no logic changes) ----------
+    # Disable EWC; RAIE is controlled by raie_enable.
     if args.mode == 'base':
         args.use_lora = False
         args.plugin = 'none'
@@ -1493,7 +1523,7 @@ def main():
         args.raie_enable = False
     elif args.mode == 'raie':
         args.use_lora = True
-        args.plugin = 'none'   # RAIE 自己走 Stage-R
+        args.plugin = 'none'   # RAIE runs Stage R.
         args.raie_enable = True
     elif args.mode == 'mole':
         args.use_lora = True
@@ -1501,7 +1531,7 @@ def main():
         args.raie_enable = False
 
     if args.use_lora and (not PEFT_AVAILABLE):
-        raise RuntimeError(f"peft not available: {_PEFT_ERR}")
+        raise RuntimeError("peft is not available in the current environment.")
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
@@ -1563,7 +1593,7 @@ def main():
         tr_loss = train_one_epoch(base_model, train_loader, optimizer, scheduler, device, pad_id, item_token_ids, args.grad_clip)
         print(f"[O][Epoch {ep}] train_loss={tr_loss:.4f}")
 
-    # Save base (optional)
+    # Save base (optional).
     torch.save({'model': base_model.state_dict(), 'vocab': id2token, 'cfg': vars(args)},
                os.path.join(args.output_dir, 'base_model.pt'))
     print('Saved base model to', os.path.join(args.output_dir, 'base_model.pt'))
@@ -1584,7 +1614,7 @@ def main():
     target_modules = [s.strip() for s in args.lora_target.split(',') if s.strip()]
     topk_tuple = tuple(int(x) for x in args.topk.split(','))
 
-    # 特殊模式：LSAT（长/短 LoRA 融合）
+    # Special mode: LSAT (long/short LoRA fusion).
     if args.mode == 'lsat':
         if finetune_ds is None or len(finetune_ds) == 0:
             raise RuntimeError('[LSAT] finetune.jsonl is required.')
@@ -1671,12 +1701,13 @@ def main():
             json.dump(metrics, f, ensure_ascii=False, indent=2)
         long_dir = os.path.join(args.output_dir, 'lora_adapter_lsat_long')
         short_dir = os.path.join(args.output_dir, 'lora_adapter_lsat_short')
-        os.makedirs(long_dir, exist_ok=True); os.makedirs(short_dir, exist_ok=True)
+        os.makedirs(long_dir, exist_ok=True)
+        os.makedirs(short_dir, exist_ok=True)
         lora_model.save_pretrained(long_dir, selected_adapters=[long_adapter])
         lora_model.save_pretrained(short_dir, selected_adapters=[short_adapter])
         return
 
-    # 特殊模式：MoLE（多专家 LoRA）
+    # Special mode: MoLE (multi-expert LoRA).
     if args.mode == 'mole':
         if finetune_ds is None or len(finetune_ds) == 0:
             raise RuntimeError('[MoLE] finetune.jsonl is required.')
@@ -1748,13 +1779,13 @@ def main():
         }, os.path.join(mole_dir, 'mole_gate.pt'))
         return
 
-    # ========== Stage F：按模式选择是否进行 ==========
+    # ========== Stage F: conditional by mode ==========
     model = base_model
     did_f_stage = False
 
-    # base 模式严格不做任何微调；其它模式若 use_lora=True 则进行 LoRA 微调
+    # Base mode skips finetuning; other modes finetune when use_lora=True.
     if (args.mode != 'base') and args.use_lora and finetune_ds is not None and len(finetune_ds) > 0:
-        # —— 收集 F 段涉及的 item 行（target 中出现且确为 item 的 token）——
+        # Collect item ids from finetune targets.
         ft_item_ids = sorted({
             token2id.get(ex.target_token, None)
             for ex in finetune_ds.examples
@@ -1762,10 +1793,10 @@ def main():
         })
         ids_t = torch.tensor(ft_item_ids, device=device) if len(ft_item_ids) > 0 else None
 
-        # —— 拍一个 item_emb 的快照（锚点）——
+        # Snapshot item embeddings for anchoring.
         E0 = base_model.item_emb.weight.detach().clone()
 
-        # LoRA 包裹
+        # Wrap with LoRA.
         lora_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -1783,7 +1814,7 @@ def main():
         FT_loader = DataLoader(finetune_ds, batch_size=args.finetune_batch_size, shuffle=True, num_workers=2,
                                collate_fn=collate)
 
-        # 只优化 LoRA 参数
+        # Optimize LoRA parameters only.
         ft_params = [p for p in model.parameters() if p.requires_grad]
         ft_optim = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
 
@@ -1805,7 +1836,7 @@ def main():
 
         did_f_stage = True
 
-        # 保存默认 LoRA 适配器（供 RAIE 或直接评测使用）
+        # Save default LoRA adapter (for RAIE or direct evaluation).
         lora_dir = os.path.join(args.output_dir, 'lora_adapter')
         os.makedirs(lora_dir, exist_ok=True)
         try:
@@ -1824,14 +1855,14 @@ def main():
         except Exception:
             pass
 
-    # ===== Stage R: RAIE（仅 raie 模式） =====
+    # ===== Stage R: RAIE (raie mode only) =====
     if args.mode == 'raie':
         if not (args.use_lora and PEFT_AVAILABLE):
-            raise RuntimeError("[RAIE] 需要启用 LoRA 且 peft 可用。")
+            raise RuntimeError("[RAIE] LoRA must be enabled and peft available.")
         if finetune_ds is None or len(finetune_ds) == 0:
-            raise RuntimeError("[RAIE] 需要 finetune.jsonl。")
+            raise RuntimeError("[RAIE] finetune.jsonl is required.")
         if original_ds is None or len(original_ds) == 0:
-            raise RuntimeError("[RAIE] 需要 original_stride1.jsonl（或自行准备同格式原始窗口数据）。")
+            raise RuntimeError("[RAIE] original_stride1.jsonl is required (or provide matching data).")
 
         print("[RAIE] Enable region-aware incremental editing for TiSASRec.")
         target_modules = [s.strip() for s in args.lora_target.split(',') if s.strip()]
@@ -1879,7 +1910,7 @@ def main():
             seed=args.seed
         )
 
-        # 分区路由评测（打印加权全局）
+        # Region routing evaluation (report weighted global metrics).
         def _eval_fn(m, loader, device, pad_id, item_token_ids, topk_tuple):
             return evaluate(m, loader, device, pad_id, item_token_ids, list(topk_tuple))
 
@@ -1905,7 +1936,7 @@ def main():
     except Exception:
         pass
 
-    # ----- Eval：按模式进行最终测试 -----
+    # ----- Evaluation: final test by mode -----
     metrics = evaluate(model, test_loader, device, pad_id, item_token_ids, topk_tuple)
     pretty = ' '.join([f"{k}:{v:.4f}" for k,v in sorted(metrics.items())])
     print(f"[T][{args.mode}] {pretty}")
@@ -1913,7 +1944,7 @@ def main():
     with open(os.path.join(args.output_dir, f'test_metrics_{args.mode}.json'), 'w', encoding='utf-8') as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    # 保存最终模型（含或不含 LoRA 包装）
+    # Save final model (with or without LoRA wrapper).
     torch.save({'model': model.state_dict(), 'vocab': id2token, 'cfg': vars(args)},
                os.path.join(args.output_dir, f'model_final_{args.mode}.pt'))
     print('Saved to', args.output_dir)
