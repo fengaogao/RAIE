@@ -6,7 +6,7 @@ In this work, we aim to make continual recommendation updates more stable and sc
 ## 2. Environment Requirement
 Below are the key packages used across the RAIE codebase with versions from your environment:
 
-- Python 3.10.19
+- Python 3.9.23
 - torch 2.8.0
 - numpy 2.0.2
 - tqdm 4.67.1
@@ -44,8 +44,6 @@ Below are the key packages used across the RAIE codebase with versions from your
 - `original_stride1.jsonl`: Same as `original.jsonl`, but generated with stride 1 for dense routing.
 - `finetune.jsonl`: Sliding-window prompt/target pairs from the finetune (F) time block.
 - `test.jsonl`: Sliding-window prompt/target pairs from the test (T) time block.
-- `original_stream.jsonl`: Full user sequences from the original block with items and timestamps.
-- `finetune_stream.jsonl`: Full user sequences from the finetune block with items and timestamps.
 - `item_ids.json`: All item IDs observed in the generated splits.
 - `meta.json`: Counts, time boundaries (`t0`, `t1`), and schema metadata.
 
