@@ -16,7 +16,7 @@ Below are the key packages used across the RAIE codebase with versions from our 
 - faiss-cpu 1.12.0
 - pandas 2.3.2
 
-## 3. File descriptions and run examples (using RAIEmodel)
+## 3. File descriptions and run examples
 
 - `SASRec_RAIE.py`: RAIE training and incremental editing flow for SASRec, including region construction and routing.
   - Example: `python SASRec_RAIE.py --mode raie --data_dir ./data/ --output_dir ./runs/RAIEmodel_sasrec --maxlen 50 --hidden_units 128`
