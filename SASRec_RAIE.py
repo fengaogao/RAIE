@@ -870,6 +870,11 @@ class RegionBankSASRec:
         p = p / (p.sum() + 1e-8)
         return k1, k2, s1, s2, float(p[k1]), float(p[k2])
 
+    def _assign_by_posterior(self, X: np.ndarray) -> np.ndarray:
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        return np.argmax(scores, axis=1).astype(np.int32)
+
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
         return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
 
@@ -1072,7 +1077,45 @@ class RegionBankSASRec:
         np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
                  centroids=self.C, radii=self.R, sig=self.sig,
                  kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
+        # After region edits (add/merge), re-assign finetune samples to final regions.
+        buckets, soft_pairs = self._reroute_from_vecs(Xn)
         return buckets, soft_pairs
+
+    def _reroute_from_vecs(self, Xn: np.ndarray):
+        if Xn.size == 0:
+            return {k: [] for k in range(self.C.shape[0])}, []
+        sims = Xn @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        soft_pairs = []
+        buckets: Dict[int, List[int]] = {k: [] for k in range(self.C.shape[0])}
+        final_assign = self._assign_by_posterior(Xn)
+        for i in range(Xn.shape[0]):
+            z = scores[i]
+            top2 = np.argsort(z)[-2:]
+            k2, k1 = int(top2[0]), int(top2[1])
+            z = z - z.max()
+            p = np.exp(self.beta_post * z)
+            p = p / (p.sum() + 1e-8)
+            p1, p2 = float(p[k1]), float(p[k2])
+            buckets[int(final_assign[i])].append(i)
+            soft_pairs.append((i, k1, k2, p1, p2))
+        return buckets, soft_pairs
+
+    def refresh_original_assignments(self, original_prompts: Dataset):
+        if hasattr(self.model, "set_adapter"):
+            self.model.set_adapter("default")
+        self.model.eval()
+        X = encode_prompts_to_vecs_sasrec(self.model, original_prompts.examples, self.id2idx,
+                                          self.maxlen, self.device, pbar=True)
+        if X.size == 0:
+            self.orig_idx_by_k = {k: [] for k in range(self.C.shape[0])}
+            return
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        route_k = np.argmax(scores, axis=1)
+        self.orig_idx_by_k = {k: [] for k in range(self.C.shape[0])}
+        for i, k in enumerate(route_k):
+            self.orig_idx_by_k[int(k)].append(i)
 
     def train_regions(self,
                       finetune_rows: List[dict],
@@ -1600,6 +1643,7 @@ def main():
     )
     _ = bank.fit_regions_on_original(original_prompts)
     region_buckets, soft_pairs = bank.map_finetune(PromptDatasetJSONL(finetune_path))
+    bank.refresh_original_assignments(original_prompts)
     bank.train_regions(
         finetune_rows=rows_f, original_rows=original_rows_for_mix,
         region_buckets=region_buckets, soft_pairs=soft_pairs, id2idx=id2idx,
