@@ -866,10 +866,12 @@ class RegionBank:
         self.R = None
         self.sig = None
         self.orig_idx_by_k = {}
+        self.original_vecs = None
 
     def fit_regions_on_original(self, original_ds, seed=42):
         X = encode_prompts_to_vecs(self.model, original_ds.examples, self.token2id,
                                    self.max_len, self.pad_id, self.cls_id, self.device, pbar=True)
+        self.original_vecs = X
         C, labels = spherical_kmeans(X, self.K, niter=30, seed=seed)
         R = per_cluster_radius(X, C, labels, q=self.q)
         sig = per_cluster_ang_std(X, C, labels)
@@ -885,6 +887,18 @@ class RegionBank:
         np.savez(os.path.join(self.out_dir, "raie_regions_init.npz"),
                  centroids=C, radii=R, sig=sig, K=self.K, dim=C.shape[1])
         return labels
+    def _assign_by_posterior(self, X: np.ndarray) -> np.ndarray:
+        sims = X @ self.C.T
+        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
+        return np.argmax(scores, axis=1).astype(np.int32)
+
+    def _refresh_original_index(self):
+        if self.original_vecs is None:
+            return
+        labels = self._assign_by_posterior(self.original_vecs)
+        self.orig_idx_by_k = {k: [] for k in range(self.C.shape[0])}
+        for i, k in enumerate(labels):
+            self.orig_idx_by_k[int(k)].append(i)
 
     def _sync_R_sig(self, new_centers=None, Xp=None, assign=None):
         K = self.C.shape[0]
@@ -1241,7 +1255,14 @@ class RegionBank:
                  centroids=self.C, radii=self.R, sig=self.sig,
                  kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
 
-        return buckets, []
+        # Re-assign finetune samples and original indices with the updated regions.
+        final_assign = self._assign_by_posterior(Xn)
+        final_buckets = defaultdict(list)
+        for i, k in enumerate(final_assign):
+            final_buckets[int(k)].append(i)
+        self._refresh_original_index()
+
+        return final_buckets, []
 
     def _ensure_adapter(self, adapter_name: str):
         if adapter_name not in getattr(self.model, "peft_config", {}):
