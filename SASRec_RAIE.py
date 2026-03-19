@@ -1167,16 +1167,15 @@ class RegionBankSASRec:
             dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
             optim = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=5e-4)
 
-            # Selective finetuning of item embeddings + anchor (same logic as original).
+            # Selective finetuning of item embeddings + anchor.
             used = set()
             for i in idx_list:
-                # Pull targets from finetune_rows via ft_ds indices for stability.
-                try:
-                    _, pos_arr, _ = ft_ds[i]
-                    tgt_ids = [int(x) for x in pos_arr.tolist() if x > 0]
-                    for t in tgt_ids: used.add(t)
-                except Exception:
-                    pass
+                tgt_tok = finetune_rows[i].get("target", "").strip()
+                if not tgt_tok:
+                    continue
+                mid = tok_to_id(tgt_tok)
+                if mid in id2idx:
+                    used.add(id2idx[mid])
 
             emb = self.model.item_emb
             E0 = emb.weight.detach().clone()
@@ -1276,9 +1275,9 @@ def main():
     parser.add_argument('--mode', type=str, default='raie',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
                         help='Mode: base / lora / lora_replay / lora_lwf / lsat / raie / mole')
-    parser.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/',
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/',
                         help='Contains original_stream.jsonl, original.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
-    parser.add_argument('--output_dir', type=str, default='./runs/sasrec_yelp')
+    parser.add_argument('--output_dir', type=str, default='./runs/sasrec_ml10M100K')
 
     # Seq / vocab
     parser.add_argument('--min_user_len', type=int, default=5)
@@ -1349,7 +1348,7 @@ def main():
     train_ds = SASRecTrainDataset(train_seq, n_items=n_items, maxlen=args.maxlen)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=train_collate)
 
-    test_path = os.path.join(args.data_dir, "test.jsonl")
+    test_path = os.path.join(args.data_dir, "original.jsonl")
     if not os.path.exists(test_path): raise FileNotFoundError(test_path)
     test_rows = read_jsonl(test_path)
     eval_ds = EvalWindowDataset(test_rows, id2idx, maxlen=args.maxlen)
@@ -1404,12 +1403,14 @@ def main():
     except Exception:
         pass
 
-    # ===== F-stage: LoRA paths + LSAT =====
-    if args.mode in ('lora','lora_replay','lora_lwf','lsat'):
+    # ===== F-stage: LoRA paths + LSAT + RAIE global adapter warmup =====
+    if args.mode in ('lora','lora_replay','lora_lwf','lsat','raie'):
         finetune_path = os.path.join(args.data_dir, "finetune.jsonl")
         if (not os.path.exists(finetune_path)):
             if args.mode == 'lsat':
                 raise RuntimeError('[LSAT] finetune.jsonl is required.')
+            if args.mode == 'raie':
+                raise RuntimeError('[RAIE] finetune.jsonl is required.')
             print("[Warn] finetune.jsonl missing. Evaluate base directly.")
             eval_model = lora_model
         else:
@@ -1522,8 +1523,25 @@ def main():
                 emb_hook = emb.weight.register_hook(_grad_mask)
                 emb_anchor_ctx = {"enabled": True, "ids_tensor": ids_tensor, "E0": E0, "lambda": 1e-4}
 
-            ft_params = [p for p in lora_model.parameters() if p.requires_grad]
-            ft_optim  = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
+            if args.mode == 'raie':
+                emb_param = emb.weight
+                no_decay = ['bias', 'LayerNorm.weight']
+                main, main_nd = [], []
+                for n, p in lora_model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if p is emb_param:
+                        continue
+                    (main_nd if any(nd in n for nd in no_decay) else main).append(p)
+
+                ft_optim = torch.optim.AdamW([
+                    {'params': main, 'lr': args.finetune_lr, 'weight_decay': args.weight_decay},
+                    {'params': main_nd, 'lr': args.finetune_lr, 'weight_decay': 0.0},
+                    {'params': [emb_param], 'lr': args.finetune_lr * 0.4, 'weight_decay': 0.0},
+                ])
+            else:
+                ft_params = [p for p in lora_model.parameters() if p.requires_grad]
+                ft_optim = torch.optim.AdamW(ft_params, lr=args.finetune_lr)
 
             replay_buf = ReplayBuffer(train_ds, batch_size=args.finetune_batch_size) if (args.mode == 'lora_replay') else None
             plugin_flag = 'none'
@@ -1548,17 +1566,18 @@ def main():
             print(f"[F] Saved LoRA adapter to {lora_dir}")
             eval_model = lora_model
 
-        # Evaluate
-        original_metrics = evaluate_windows(eval_model, original_loader, n_items, list(topk_tuple), device)
-        tag = args.mode
-        print(f"[original][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
+        if args.mode != 'raie':
+            # Evaluate
+            original_metrics = evaluate_windows(eval_model, original_loader, n_items, list(topk_tuple), device)
+            tag = args.mode
+            print(f"[original][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(original_metrics.items())]))
 
-        metrics = evaluate_windows(eval_model, eval_loader, n_items, list(topk_tuple), device)
-        tag = args.mode
-        print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(metrics.items())]))
-        with open(os.path.join(args.output_dir, f"test_metrics_{tag}.json"), "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-        return
+            metrics = evaluate_windows(eval_model, eval_loader, n_items, list(topk_tuple), device)
+            tag = args.mode
+            print(f"[Test][{tag}]", ' '.join([f"{k}:{v:.6f}" for k, v in sorted(metrics.items())]))
+            with open(os.path.join(args.output_dir, f"test_metrics_{tag}.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            return
 
     # ===== MoLE：Mixture-of-LoRA-Experts =====
     if args.mode == 'mole':
@@ -1643,7 +1662,7 @@ def main():
     )
     _ = bank.fit_regions_on_original(original_prompts)
     region_buckets, soft_pairs = bank.map_finetune(PromptDatasetJSONL(finetune_path))
-    bank.refresh_original_assignments(original_prompts)
+    # bank.refresh_original_assignments(original_prompts)
     bank.train_regions(
         finetune_rows=rows_f, original_rows=original_rows_for_mix,
         region_buckets=region_buckets, soft_pairs=soft_pairs, id2idx=id2idx,
