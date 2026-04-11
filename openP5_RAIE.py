@@ -47,10 +47,10 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 _TOKEN_RE = re.compile(r"<item_(\d+)>")
-PROMPT_TEMPLATE = (
-    "Here is the purchase history of user_{user_id}: item {history}. "
-    "I wonder what is the next recommended item for the user. Answer:"
-)
+# PROMPT_TEMPLATE = (
+#     "Here is the purchase history of user_{user_id}: item {history}. "
+#     "I wonder what is the next recommended item for the user. Answer:"
+# )
 
 # ------------------------------
 # Utils & DDP
