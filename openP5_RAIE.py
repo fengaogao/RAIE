@@ -6,7 +6,6 @@ import json
 import random
 import argparse
 import re
-import time
 from typing import List, Dict, Tuple, Optional
 from datetime import timedelta
 from collections import defaultdict
@@ -47,10 +46,6 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 _TOKEN_RE = re.compile(r"<item_(\d+)>")
-# PROMPT_TEMPLATE = (
-#     "Here is the purchase history of user_{user_id}: item {history}. "
-#     "I wonder what is the next recommended item for the user. Answer:"
-# )
 
 # ------------------------------
 # Utils & DDP
@@ -94,28 +89,8 @@ def bcast_object(obj, src=0, use_gloo=True):
 
 def cleanup_distributed():
     if is_distributed_env() and dist.is_initialized():
-        distributed_barrier()
+        dist.barrier()
         dist.destroy_process_group()
-
-def distributed_barrier(local_rank: Optional[int] = None, use_gloo: bool = False):
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    if use_gloo and dist.get_backend() == "nccl":
-        dist.barrier(group=_get_gloo_group())
-        return
-    if dist.get_backend() == "nccl" and torch.cuda.is_available():
-        if local_rank is None:
-            local_rank = torch.cuda.current_device()
-        dist.barrier(device_ids=[local_rank])
-        return
-    dist.barrier()
-
-def wait_for_file(flag_path: str, poll_interval: float = 5.0, timeout_hours: float = 24.0):
-    deadline = time.time() + timeout_hours * 3600.0
-    while not os.path.exists(flag_path):
-        if time.time() > deadline:
-            raise TimeoutError(f"Timed out waiting for file: {flag_path}")
-        time.sleep(poll_interval)
 
 def set_seed(seed: int = 42, rank: int = 0):
     seed = seed + rank
@@ -127,22 +102,6 @@ def set_seed(seed: int = 42, rank: int = 0):
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
-
-def load_tokenizer_with_pad(model_path: str, use_fast: bool = True):
-    tok = AutoTokenizer.from_pretrained(model_path, use_fast=use_fast)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    return tok
-
-def load_causal_lm(model_path: str, load_dtype: torch.dtype):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        low_cpu_mem_usage=True,
-        dtype=load_dtype,
-    )
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-    return model
 
 def aggressive_gc():
     """Perform aggressive garbage collection to reduce GPU fragmentation."""
@@ -356,25 +315,16 @@ def collate_batch(batch, pad_id: int):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "target_item_idx": target_item_idx}
 
 class SeqRecDatasetFromPairs(Dataset):
-    def __init__(
-        self,
-        jsonl_path: str,
-        mid2idx: Dict[int, int],
-        tokenizer,
-        item_token_seq: List[List[str]],
-        max_history: int = 50,
-        max_prompt_length: int = 192,
-        max_answer_length: int = 32,
-        max_input_length: int = 256,
-        final_token_only_loss: bool = True,
-    ):
+    def __init__(self, jsonl_path: str, mid2idx: Dict[int,int],
+                 tokenizer, item_token_seq: List[List[str]], max_history: int = 50,
+                 wrap_mode: str = 'none',
+                 final_token_only_loss: bool = True,
+                 deterministic_template: bool = False):
+        assert wrap_mode in ('none',)
         self.examples = []
         self.tok = tokenizer
         self.item_token_seq = item_token_seq
         self.max_history = max_history
-        self.max_prompt_length = max_prompt_length
-        self.max_answer_length = max_answer_length
-        self.max_input_length = max_input_length
         self.final_token_only_loss = final_token_only_loss
 
         rows = _load_jsonl(jsonl_path)
@@ -383,6 +333,7 @@ class SeqRecDatasetFromPairs(Dataset):
             tg = (r.get("target") or "").strip()
             if not pr or not tg:
                 continue
+            raw_user_id = r.get("user_id", "unknown")
             try:
                 mids_ctx = [_tok_to_mid(t) for t in pr.split()]
                 mid_tgt  = _tok_to_mid(tg)
@@ -393,32 +344,25 @@ class SeqRecDatasetFromPairs(Dataset):
                 continue
             idx_ctx = idx_ctx[-max_history:]
             idx_tgt = mid2idx[mid_tgt]
-            user_id = r.get("user_id", 0)
 
             hist_tokens = []
             for i in idx_ctx:
                 hist_tokens.extend(item_token_seq[i])
             history_text = " ".join(hist_tokens)
+            user_id = str(raw_user_id).strip() or "unknown"
+            if deterministic_template:
+                prompt_text = (
+                    f"Here is the purchase history of user_{user_id}: item {history_text}. "
+                    f"I wonder what is the next recommended item for the user. Answer:"
+                )
+            else:
+                prompt_text = history_text
             answer_text = " ".join(item_token_seq[idx_tgt])
-            prompt_text = PROMPT_TEMPLATE.format(user_id=user_id, history=history_text)
 
-            answer_budget = max(1, min(max_answer_length, max_input_length - 1))
-            enc_answer = self.tok(
-                answer_text,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=answer_budget,
-            )
+            enc_prompt = self.tok(prompt_text, add_special_tokens=True)
+            enc_answer = self.tok(answer_text, add_special_tokens=False)
             if len(enc_answer["input_ids"]) == 0:
                 continue
-
-            prompt_budget = max(1, min(max_prompt_length, max_input_length - len(enc_answer["input_ids"])))
-            enc_prompt = self.tok(
-                prompt_text,
-                add_special_tokens=True,
-                truncation=True,
-                max_length=prompt_budget,
-            )
 
             input_ids = enc_prompt["input_ids"] + enc_answer["input_ids"]
             attention_mask = enc_prompt["attention_mask"] + enc_answer["attention_mask"]
@@ -435,8 +379,6 @@ class SeqRecDatasetFromPairs(Dataset):
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "labels": torch.tensor(lab, dtype=torch.long),
                 "target_item_idx": torch.tensor(idx_tgt, dtype=torch.long),
-                "prompt_input_ids": torch.tensor(enc_prompt["input_ids"], dtype=torch.long),
-                "prompt_attention_mask": torch.tensor(enc_prompt["attention_mask"], dtype=torch.long),
             })
 
     def __len__(self): return len(self.examples)
@@ -573,7 +515,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device,
     model.train()
     total = 0.0
     use_amp = fp16 and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     item_ids = torch.tensor(item_final_token_ids, device=device)
 
     for batch in tqdm(dataloader, desc="Train(O)", disable=not is_main):
@@ -692,7 +634,7 @@ def finetune_one_epoch_lora(
 ):
     lora_model.train()
     use_amp = fp16 and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc=f"Finetune(F)-{plugin}"), start=1):
         loss, _ = ce_loss_on_items(lora_model, batch, device, item_final_token_ids, fp16=use_amp)
@@ -828,7 +770,7 @@ def finetune_one_epoch_mole(
 ):
     mole_model.train()
     use_amp = fp16 and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total_loss, n_steps = 0.0, 0
     for step, batch in enumerate(tqdm(finetune_loader, desc="Finetune(F)-MoLE"), start=1):
         input_ids = batch['input_ids'].to(device, non_blocking=True)
@@ -897,16 +839,14 @@ def encode_prompts_to_vecs_causallm(model, ds: Dataset, device, tok: AutoTokeniz
     for i in tqdm(range(0, len(ds), batch_size), desc="Enc(prompts)"):
         sub = [ds[j] for j in range(i, min(i+batch_size, len(ds)))]
         if len(sub) == 0: break
-        maxL = max(int(r.get("prompt_input_ids", r["input_ids"]).size(0)) for r in sub)
+        maxL = max(int(r["input_ids"].size(0)) for r in sub)
         pad_id = tok.pad_token_id or tok.eos_token_id
         input_ids = torch.full((len(sub), maxL), pad_id, dtype=torch.long)
         attn = torch.zeros((len(sub), maxL), dtype=torch.long)
         for j, r in enumerate(sub):
-            prompt_ids = r.get("prompt_input_ids", r["input_ids"])
-            prompt_attn = r.get("prompt_attention_mask", r["attention_mask"])
-            L = int(prompt_ids.size(0))
-            input_ids[j, :L] = prompt_ids
-            attn[j, :L] = prompt_attn
+            L = int(r["input_ids"].size(0))
+            input_ids[j, :L] = r["input_ids"]
+            attn[j, :L] = r["attention_mask"]
         input_ids = input_ids.to(device); attn = attn.to(device)
         out = model(input_ids=input_ids, attention_mask=attn, output_hidden_states=True, return_dict=True)
         h = out.hidden_states[-1]  # [B, L, H]
@@ -954,7 +894,7 @@ def finetune_one_epoch_causal_anchor(
     """
     model.train()
     use_amp = fp16 and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     total, nstep = 0.0, 0
     for batch in tqdm(finetune_loader, desc="Finetune(F)-Anchor"):
         loss, _ = ce_loss_on_items(model, batch, device, item_final_token_ids, fp16=use_amp)
@@ -986,7 +926,7 @@ def save_clean_base_with_new_tokens(peft_wrapped, tokenizer, out_dir, orig_base_
     with torch.no_grad():
         trained_E = peft_wrapped.get_input_embeddings().weight.detach().cpu().clone()
 
-    base_clean = load_causal_lm(orig_base_path, trained_E.dtype)
+    base_clean = AutoModelForCausalLM.from_pretrained(orig_base_path, low_cpu_mem_usage=True, torch_dtype=trained_E.dtype)
     base_clean.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 
     with torch.no_grad():
@@ -1103,11 +1043,6 @@ class RegionBank:
         z = scores - scores.max()
         p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
         return k1, k2, s1, s2, float(p[k1]), float(p[k2])
-
-    def _assign_by_posterior(self, X: np.ndarray) -> np.ndarray:
-        sims = X @ self.C.T
-        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
-        return np.argmax(scores, axis=1).astype(np.int32)
 
     def _tau_assign(self, k: int, a0: float = 0.5, a1: float = 0.1):
         return 1.0 / (1.0 + np.exp(-(a0 + a1 * np.log(self.kappa[k] + 1e-6))))
@@ -1387,40 +1322,7 @@ class RegionBank:
         np.savez(os.path.join(self.out_dir, "raie_regions_after_map.npz"),
                  centroids=self.C, radii=self.R, sig=self.sig,
                  kappa=self.kappa, pi=self.pi, S=self.S, n=self.n)
-        # After region edits (add/merge), re-assign finetune samples to final regions.
-        buckets, soft_pairs = self._reroute_from_vecs(Xn)
         return buckets, soft_pairs
-
-    def _reroute_from_vecs(self, Xn: np.ndarray):
-        if Xn.size == 0:
-            return {}, []
-        sims = Xn @ self.C.T
-        scores = np.log(np.clip(self.pi, 1e-8, None))[None, :] + sims * self.kappa[None, :]
-        buckets = defaultdict(list)
-        soft_pairs = []
-        final_assign = self._assign_by_posterior(Xn)
-        for i in range(Xn.shape[0]):
-            z = scores[i]
-            top2 = np.argsort(z)[-2:]
-            k2, k1 = int(top2[0]), int(top2[1])
-            z = z - z.max()
-            p = np.exp(self.beta_post * z); p = p / (p.sum() + 1e-8)
-            p1, p2 = float(p[k1]), float(p[k2])
-            buckets[int(final_assign[i])].append(i)
-            soft_pairs.append((i, k1, k2, p1, p2))
-        return buckets, soft_pairs
-
-    def refresh_original_assignments(self):
-        if self.original_ds is None or len(self.original_ds) == 0:
-            return
-        X = encode_prompts_to_vecs_causallm(self.model, self.original_ds, self.device, self.tok, batch_size=256)
-        if X.size == 0:
-            self.orig_idx_by_k = {int(k): [] for k in range(self.C.shape[0])}
-            return
-        route_k = self._assign_by_posterior(X)
-        self.orig_idx_by_k = {int(k): [] for k in range(self.C.shape[0])}
-        for i, k in enumerate(route_k):
-            self.orig_idx_by_k[int(k)].append(i)
 
     # ---------- Adapter setup ----------
     def _ensure_adapter(self, adapter_name: str):
@@ -1602,11 +1504,9 @@ def make_datasets_for_stage(args, tok, mid2idx, n_items):
     def make_ds(jsonl_path):
         return SeqRecDatasetFromPairs(
             jsonl_path, mid2idx, tok, item_token_seq,
-            max_history=args.max_history,
-            max_prompt_length=args.max_prompt_length,
-            max_answer_length=args.max_answer_length,
-            max_input_length=args.max_input_length,
+            max_history=args.max_history, wrap_mode="none",
             final_token_only_loss=args.final_token_only_loss,
+            deterministic_template=True
         )
 
     train_jsonl_path = args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl")
@@ -1649,9 +1549,11 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     # 2) Tokenizer & model (extend vocab)
     if is_main:
         print("[Model] Loading tokenizer and model ...")
-    tok = load_tokenizer_with_pad(args.model_name_or_path)
-    model = load_causal_lm(args.model_name_or_path, load_dtype)
-    if args.grad_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+    if args.grad_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
 
     final_item_tokens = make_item_final_tokens(n_items)
@@ -1706,11 +1608,9 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     def make_ds(jsonl_path):
         return SeqRecDatasetFromPairs(
             jsonl_path, mid2idx, tok, item_token_seq,
-            max_history=args.max_history,
-            max_prompt_length=args.max_prompt_length,
-            max_answer_length=args.max_answer_length,
-            max_input_length=args.max_input_length,
+            max_history=args.max_history, wrap_mode="none",
             final_token_only_loss=args.final_token_only_loss,
+            deterministic_template=True
         )
 
     ds_trainO = make_ds(args.train_jsonl_path or os.path.join(args.data_dir, "original_stride1.jsonl"))
@@ -1767,29 +1667,22 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
             print(f"[Train][O] epoch={ep} loss={loss:.4f}")
 
     if is_distributed:
-        distributed_barrier(local_rank)
+        dist.barrier()
     if is_main:
         base_dir = os.path.join(args.output_dir, 'base_model')
         os.makedirs(base_dir, exist_ok=True)
         base_eval_model = model.module if hasattr(model, "module") else model
         base_eval_model.save_pretrained(base_dir)
-        mO = evaluate_causal(base_eval_model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-O")
-        mT = evaluate_causal(base_eval_model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-T")
+        mO = evaluate_causal(model, ld_O, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-O")
+        mT = evaluate_causal(model, ld_T, device, item_final_token_ids, k_list=k_list, fp16=args.fp16, desc="Eval-T")
         with open(os.path.join(args.output_dir, "metrics_original.json"), "w", encoding="utf-8") as f:
             json.dump(mO, f, ensure_ascii=False, indent=2)
         with open(os.path.join(args.output_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
             json.dump(mT, f, ensure_ascii=False, indent=2)
     if is_distributed:
-        distributed_barrier(local_rank)
+        dist.barrier()
 
     # Save default adapter + clean base (with new vocab) + mid2idx.json
-    save_done_flag = os.path.join(args.output_dir, ".stage_pre_save.done")
-    if is_main and os.path.exists(save_done_flag):
-        try:
-            os.remove(save_done_flag)
-        except OSError:
-            pass
-
     if is_main and args.use_lora:
         default_dir = os.path.join(args.output_dir, "default")
         ensure_dir(default_dir)
@@ -1809,20 +1702,8 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
         print(f"[SAVE] clean base saved to {base_dir}")
         # Save mid2idx.
         save_mid2idx(os.path.join(args.output_dir, "mid2idx.json"), mid2idx)
-        with open(save_done_flag, "w", encoding="utf-8") as f:
-            f.write("ok\n")
-    elif is_distributed and args.use_lora:
-        wait_for_file(save_done_flag)
-
     if is_distributed:
-        distributed_barrier(local_rank)
-    if is_main and args.use_lora and os.path.exists(save_done_flag):
-        try:
-            os.remove(save_done_flag)
-        except OSError:
-            pass
-    if is_distributed:
-        distributed_barrier(local_rank)
+        dist.barrier()
     try:
         del optimizer, scheduler
     except Exception:
@@ -1835,8 +1716,12 @@ def stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype):
     aggressive_gc()
 
 def fresh_lora_model_from_base(base_dir, device, lora_r, lora_alpha, lora_dropout, load_dtype):
-    tok2 = load_tokenizer_with_pad(base_dir)
-    m = load_causal_lm(base_dir, load_dtype)
+    tok2 = AutoTokenizer.from_pretrained(base_dir, use_fast=True)
+    if tok2.pad_token is None: tok2.pad_token = tok2.eos_token
+    m = AutoModelForCausalLM.from_pretrained(
+        base_dir, low_cpu_mem_usage=True, torch_dtype=load_dtype,
+    )
+    if hasattr(m.config, "use_cache"): m.config.use_cache = False
     lcfg = LoraConfig(
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         bias="none", task_type=TaskType.CAUSAL_LM,
@@ -1911,7 +1796,7 @@ def stage_lora(args, device, is_distributed, local_rank, is_main, load_dtype):
     except Exception:
         pass
     _free_cuda(lora_model)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 def stage_replay(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
@@ -1982,7 +1867,7 @@ def stage_replay(args, device, is_distributed, local_rank, is_main, load_dtype):
     except Exception:
         pass
     _free_cuda(rep_model)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 def stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
@@ -2020,7 +1905,9 @@ def stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype):
     ld_O = DataLoader(ds_O, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
     ld_T = DataLoader(ds_T, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
 
-    teacher = load_causal_lm(base_dir, load_dtype)
+    teacher = AutoModelForCausalLM.from_pretrained(base_dir, low_cpu_mem_usage=True, torch_dtype=load_dtype)
+    if hasattr(teacher.config, "use_cache"):
+        teacher.config.use_cache = False
     teacher.to(device)
     teacher.eval()
     for p in teacher.parameters():
@@ -2055,7 +1942,7 @@ def stage_lwf(args, device, is_distributed, local_rank, is_main, load_dtype):
         pass
     _free_cuda(lwf_model)
     _free_cuda(teacher)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 def stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
@@ -2158,7 +2045,7 @@ def stage_lsat(args, device, is_distributed, local_rank, is_main, load_dtype):
     except Exception:
         pass
     _free_cuda(lsat_model)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 def _cast_trainable_mole_params_to_fp32(peft_model, adapter_names: List[str]):
     """Keep base weights in FP16 while moving trainable MoLE adapters to FP32."""
@@ -2309,7 +2196,7 @@ def stage_mole(args, device, is_distributed, local_rank, is_main, load_dtype):
     except Exception:
         pass
     _free_cuda(mole_model)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     base_dir = args.resume_base_dir or os.path.join(args.output_dir, "base_with_new_tokens")
@@ -2397,7 +2284,6 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
     if is_main:
         _ = bank.fit_regions_on_original(seed=args.seed)
         region_buckets, soft_pairs = bank.map_finetune(ds_F, pool_min=120, bic_gain=1e4)
-        bank.refresh_original_assignments()
     else:
         bank.C = bank.R = bank.sig = bank.kappa = bank.pi = None
         bank.S = bank.n = None
@@ -2405,7 +2291,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         region_buckets = None; soft_pairs = None
     # ==== Barrier here to sync all ranks before creating/using the gloo group ====
     if is_distributed:
-        distributed_barrier(local_rank)
+        dist.barrier()
 
     bank.C = bcast_object(bank.C, src=0)
     bank.R = bcast_object(bank.R, src=0)
@@ -2435,7 +2321,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         )
 
     if is_distributed:
-        distributed_barrier(local_rank)  # Wait for rank0 to finish training and saving region adapters.
+        dist.barrier()  # Wait for rank0 to finish training and saving region adapters.
 
     if is_main:
         k_list = sorted(set(args.topk))
@@ -2448,7 +2334,7 @@ def stage_raie(args, device, is_distributed, local_rank, is_main, load_dtype):
         print("[Done] RAIE:", mO, mT)
 
     _free_cuda(raie_model, rm)
-    if is_distributed: distributed_barrier(local_rank)
+    if is_distributed: dist.barrier()
 
 # ------------------------------
 # Main entry (with --stage routing)
@@ -2475,10 +2361,7 @@ def main():
 
     ap.add_argument('--item_indexing', type=str, choices=['sequential', 'random', 'collaborative'], default='sequential')
     ap.add_argument('--min_user_len', type=int, default=5)
-    ap.add_argument('--max_history', type=int, default=20)
-    ap.add_argument('--max_prompt_length', type=int, default=192)
-    ap.add_argument('--max_answer_length', type=int, default=32)
-    ap.add_argument('--max_input_length', type=int, default=256)
+    ap.add_argument('--max_history', type=int, default=10)
 
     # Training
     ap.add_argument('--epochs', type=int, default=5)
@@ -2537,12 +2420,12 @@ def main():
     args = ap.parse_args()
 
     # DDP init
-    is_distributed, rank, _, local_rank = init_distributed()
+    is_distributed, rank, world_size, local_rank = init_distributed()
     is_main = (rank == 0)
     set_seed(args.seed, rank)
 
-    # Use bfloat16 for model loading to reduce memory while keeping a wider numeric range.
-    load_dtype = torch.bfloat16
+    # Dtype control (reduce reload memory).
+    load_dtype = torch.float16
 
     if torch.cuda.is_available():
         device = torch.device(f'cuda:{local_rank}' if is_distributed else 'cuda')
@@ -2565,7 +2448,7 @@ def main():
         if need_pre:
             stage_pre(args, device, is_distributed, local_rank, is_main, load_dtype)
         else:
-            if is_distributed: distributed_barrier(local_rank)
+            if is_distributed: dist.barrier()
 
     if args.stage in ("all", "lora"):
         stage_lora(args, device, is_distributed, local_rank, is_main, load_dtype)
@@ -2590,7 +2473,7 @@ def main():
 
         if is_distributed and dist.is_initialized():
             try:
-                distributed_barrier(local_rank)
+                dist.barrier()
             except Exception:
                 pass
             try:
