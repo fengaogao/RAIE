@@ -1477,9 +1477,9 @@ def main():
     parser.add_argument('--mode', type=str, default='raie',
                         choices=['base','lora','lora_replay','lora_lwf','lsat','raie','mole'],
                         help='Modes: base / lora / lora_replay / lora_lwf / lsat / raie / mole')
-    parser.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/',
+    parser.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/',
                         help='Contains original_stream.jsonl, finetune.jsonl, test.jsonl, item_ids.json')
-    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_yelp')
+    parser.add_argument('--output_dir', type=str, default='./runs/Bert4rec_ml10M100K')
 
     # Sequence / vocab
     parser.add_argument('--max_len', type=int, default=20, help='Length of prompt (without [CLS])')
@@ -1495,7 +1495,7 @@ def main():
     parser.add_argument('--mask_prob', type=float, default=0.15)
 
     # O-stage Train
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
