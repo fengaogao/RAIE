@@ -1460,8 +1460,8 @@ def main():
                     choices=['base', 'lora', 'lora_replay', 'lora_lwf', 'lsat', 'raie', 'mole'],
                     help='Mode: base / lora / lora_replay / lora_lwf / lsat / raie / mole')
 
-    ap.add_argument('--data_dir', type=str, default='/home/zj/code/yelp/')
-    ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_yelp')
+    ap.add_argument('--data_dir', type=str, default='/home/zj/code/ml-10M100K/')
+    ap.add_argument('--output_dir', type=str, default='./runs/TiSASRec_ml10M100K')
 
     ap.add_argument('--max_len', type=int, default=20)
     ap.add_argument('--hidden_size', type=int, default=256)
@@ -1475,7 +1475,7 @@ def main():
     ap.add_argument('--time_clamp', type=int, default=60, help='Clamp intervals > N days to last bucket; set -1 to disable')
     ap.add_argument('--train_stride', type=int, default=1)
     ap.add_argument('--min_ctx', type=int, default=1)
-    ap.add_argument('--batch_size', type=int, default=512)
+    ap.add_argument('--batch_size', type=int, default=128)
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--lr', type=float, default=5e-4)
     ap.add_argument('--weight_decay', type=float, default=0.0)
